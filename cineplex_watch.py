@@ -149,15 +149,62 @@ class Api:
             return http_get_json(url, {"Ocp-Apim-Subscription-Key": self.key})
 
 
+NAME_FIELDS = ("name", "theatreName", "displayName", "title", "locationName")
+ID_FIELDS = ("id", "theatreId", "locationId", "theatreID")
+
+
+def describe_shape(node, depth: int = 0) -> str:
+    """A one-line sketch of a JSON value, for diagnosing an unexpected response."""
+    if isinstance(node, dict):
+        if depth >= 2:
+            return "{...}"
+        inner = ", ".join(f"{k}: {describe_shape(v, depth + 1)}" for k, v in list(node.items())[:12])
+        return "{" + inner + ("}" if len(node) <= 12 else ", ...}")
+    if isinstance(node, list):
+        return f"[{len(node)} x {describe_shape(node[0], depth + 1) if node else 'empty'}]"
+    return type(node).__name__
+
+
+def looks_like_theatre(node) -> bool:
+    return (
+        isinstance(node, dict)
+        and any(node.get(f) for f in NAME_FIELDS)
+        and any(node.get(f) is not None for f in ID_FIELDS)
+    )
+
+
+def find_record_list(node, predicate, depth: int = 0) -> list | None:
+    """Depth-first search for the first list whose entries satisfy `predicate`.
+
+    Cineplex has moved this payload between a bare array and various envelopes.
+    Searching for the records by their shape rather than by a fixed key means a
+    re-wrapped response does not silently read as "zero theatres".
+    """
+    if depth > 6:
+        return None
+    if isinstance(node, list):
+        if node and all(predicate(item) for item in node[:3]):
+            return node
+        for item in node:
+            found = find_record_list(item, predicate, depth + 1)
+            if found:
+                return found
+    elif isinstance(node, dict):
+        for value in node.values():
+            found = find_record_list(value, predicate, depth + 1)
+            if found:
+                return found
+    return None
+
+
 def list_theatres(api: Api, language: str = "en") -> list[dict]:
     payload = api.get("theatres", {"language": language})
-    if isinstance(payload, list):
-        return payload
-    for field in ("items", "theatres", "data", "results"):
-        value = payload.get(field)
-        if isinstance(value, list):
-            return value
-    return []
+    found = find_record_list(payload, looks_like_theatre)
+    if found is None:
+        log(f"  !! no theatre records found in the response; shape was {describe_shape(payload)}")
+        log("  !! raw response (truncated): " + json.dumps(payload)[:1500])
+        return []
+    return found
 
 
 def get_showtimes(api: Api, location_id: str, date_iso: str, language: str = "en") -> dict:
@@ -225,9 +272,25 @@ def date_prefix(value) -> str:
     return value[:10]
 
 
+def looks_like_day(node) -> bool:
+    return isinstance(node, dict) and isinstance(node.get("movies"), list)
+
+
+def extract_days(payload) -> list[dict]:
+    """Pull the per-date blocks out of a showtimes response.
+
+    Same reasoning as find_record_list for theatres: match on the shape of the
+    records so a re-wrapped envelope does not read as "no showtimes".
+    """
+    days = payload.get("dates") if isinstance(payload, dict) else None
+    if isinstance(days, list) and days:
+        return days
+    return find_record_list(payload, looks_like_day) or []
+
+
 def iter_sessions(payload: dict, target_dates: list[str]):
     """Yield (date, movie, experience, session) for the dates we care about."""
-    for day in payload.get("dates") or []:
+    for day in extract_days(payload):
         day_iso = date_prefix(day.get("startDate") or day.get("date"))
         if target_dates and day_iso not in target_dates:
             continue
@@ -443,6 +506,12 @@ def resolve_theatres(api: Api, cfg: dict) -> list[tuple[str, str]]:
                 pair = (str(tid), name)
                 if pair not in resolved:
                     resolved.append(pair)
+
+    if not resolved and catalogue:
+        log("  !! no theatre matched the config. A sample of what the API returned:")
+        for theatre in catalogue[:25]:
+            log(f"       {field(theatre, *NAME_FIELDS)!r}")
+        log(f"     (showing 25 of {len(catalogue)})")
     return resolved
 
 
@@ -562,10 +631,11 @@ def probe(cfg: dict, dump: Path | None = None) -> int:
             payload = get_showtimes(api, tid, date_iso, cfg.get("language", "en"))
             raw_dump[f"{tid}@{date_iso}"] = payload
 
-            log(f"  top-level keys: {sorted(payload.keys())}")
-            days = payload.get("dates") or []
+            log(f"  response shape: {describe_shape(payload)}")
+            days = extract_days(payload)
             if not days:
-                log("  !! no `dates` array in the response -- shape may have changed")
+                log("  !! no per-date blocks found in the response")
+                log("  !! raw (truncated): " + json.dumps(payload)[:1500])
                 continue
             log(f"  {len(days)} date block(s): "
                 f"{[date_prefix(d.get('startDate') or d.get('date')) for d in days]}")

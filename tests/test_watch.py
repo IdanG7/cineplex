@@ -214,5 +214,63 @@ class TestApiKeyRecovery(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
 
+class TestShapeTolerance(unittest.TestCase):
+    """The live /theatres response did not match any of the keys originally
+    guessed, and the watcher reported "0 theatres" instead of saying why.
+    These cover the envelopes it now survives."""
+
+    THEATRE = {"id": 1234, "name": "Cineplex Cinemas Vaughan"}
+
+    def test_finds_a_bare_array(self):
+        self.assertEqual(w.find_record_list([self.THEATRE], w.looks_like_theatre), [self.THEATRE])
+
+    def test_finds_a_list_behind_an_unknown_envelope_key(self):
+        for key in ("items", "theatres", "payload", "somethingNew"):
+            found = w.find_record_list({key: [self.THEATRE]}, w.looks_like_theatre)
+            self.assertEqual(found, [self.THEATRE], key)
+
+    def test_finds_a_deeply_nested_list(self):
+        blob = {"data": {"result": {"locations": [self.THEATRE]}}}
+        self.assertEqual(w.find_record_list(blob, w.looks_like_theatre), [self.THEATRE])
+
+    def test_returns_none_when_there_is_no_such_list(self):
+        self.assertIsNone(w.find_record_list({"error": "nope"}, w.looks_like_theatre))
+        self.assertIsNone(w.find_record_list({"dates": []}, w.looks_like_theatre))
+
+    def test_a_record_needs_both_a_name_and_an_id(self):
+        self.assertFalse(w.looks_like_theatre({"name": "No id"}))
+        self.assertFalse(w.looks_like_theatre({"id": 1}))
+        self.assertTrue(w.looks_like_theatre({"theatreId": 1, "theatreName": "X"}))
+
+    def test_alternate_id_and_name_fields_are_accepted(self):
+        blob = {"d": [{"locationId": "77", "displayName": "Cineplex Odeon"}]}
+        self.assertEqual(len(w.find_record_list(blob, w.looks_like_theatre)), 1)
+
+    def test_extract_days_prefers_the_top_level_dates_key(self):
+        self.assertEqual(len(w.extract_days(FIXTURE)), 2)
+
+    def test_extract_days_finds_a_wrapped_payload(self):
+        self.assertEqual(len(w.extract_days({"result": {"dates": FIXTURE["dates"]}})), 2)
+
+    def test_extract_days_on_a_useless_payload_is_empty_not_an_error(self):
+        self.assertEqual(w.extract_days({"message": "unauthorized"}), [])
+
+    def test_matching_still_works_through_a_wrapped_payload(self):
+        wrapped = {"data": {"showtimes": {"dates": FIXTURE["dates"]}}}
+        keys = {h["key"].split(":")[-1] for h in w.find_matches(wrapped, "9999", "T", CONFIG)}
+        self.assertEqual(keys, {"HIT-A", "HIT-B", "HIT-C-TITLE-ONLY"})
+
+
+class TestDescribeShape(unittest.TestCase):
+    def test_summarises_without_dumping_everything(self):
+        out = w.describe_shape({"dates": [{"startDate": "x", "movies": []}]})
+        self.assertIn("dates", out)
+        self.assertIn("1 x", out)
+
+    def test_handles_scalars_and_empty_lists(self):
+        self.assertEqual(w.describe_shape([]), "[0 x empty]")
+        self.assertEqual(w.describe_shape("hi"), "str")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
