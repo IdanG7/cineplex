@@ -57,8 +57,34 @@ def http_get(url: str, headers: dict | None = None, timeout: int = 30) -> bytes:
 
 
 def http_get_json(url: str, headers: dict | None = None, timeout: int = 30) -> dict:
-    raw = http_get(url, {"Accept": "application/json", **(headers or {})}, timeout)
-    return json.loads(raw.decode("utf-8"))
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json",
+            # urllib does not negotiate compression; say so explicitly rather
+            # than risk being handed a gzip body we would fail to decode.
+            "Accept-Encoding": "identity",
+            **(headers or {}),
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+        status = resp.status
+        ctype = resp.headers.get("Content-Type", "")
+
+    if not raw.strip():
+        # Cineplex answers a date with nothing on it with an empty body rather
+        # than an empty array. That is a normal "nothing yet", not a failure,
+        # and it must not take the run down -- the watcher's whole job is to
+        # sit through weeks of exactly this until the date opens.
+        log(f"    empty body (HTTP {status}, {ctype or 'no content-type'})")
+        return {}
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except json.JSONDecodeError:
+        log(f"    non-JSON body (HTTP {status}, {ctype}): {raw[:300]!r}")
+        raise
 
 
 def http_post(url: str, data: bytes, headers: dict | None = None, timeout: int = 20) -> int:
@@ -621,7 +647,48 @@ def probe(cfg: dict, dump: Path | None = None) -> int:
         log("  !! nothing matched `theatres[].nameContains` in the config")
         return 1
 
-    raw_dump: dict = {}
+    # Control query. An empty response for 17 Sept could mean the date is not
+    # on sale yet, or it could mean the request itself is malformed -- and those
+    # look identical from the outside. Asking for a date that certainly does
+    # have showtimes separates them, and doubles as ground truth for the field
+    # names the matcher depends on.
+    control_date = datetime.now(timezone.utc).date().isoformat()
+    ctl_id, ctl_name = theatres[0]
+    log(f"\n--- control: today ({control_date}) at {ctl_name} ---")
+    control = get_showtimes(api, ctl_id, control_date, cfg.get("language", "en"))
+    control_days = extract_days(control)
+    if not control_days:
+        log("  !! CONTROL FAILED: today returned nothing either.")
+        log(f"  !! shape: {describe_shape(control)}")
+        log("  !! The request format is probably wrong, not the date.")
+    else:
+        log(f"  control OK: {len(control_days)} date block(s) — the request format is correct.")
+        films = [
+            field(m, "name", "title", "filmName", "movieName")
+            for d in control_days
+            for m in (d.get("movies") or [])
+        ]
+        log(f"  {len(films)} film(s) listed today, e.g. {films[:5]}")
+        sample = next(
+            (
+                (mv, ex, s)
+                for d in control_days
+                for mv in (d.get("movies") or [])
+                for ex in (mv.get("experiences") or [])
+                for s in (ex.get("sessions") or [])
+            ),
+            None,
+        )
+        if sample:
+            movie, experience, session = sample
+            log(f"  sample movie keys:      {sorted(movie.keys())}")
+            log(f"  sample experience keys: {sorted(experience.keys())}")
+            log(f"  sample experienceTypes: {json.dumps(experience.get('experienceTypes'))[:200]}")
+            log(f"  sample session:         {json.dumps(session)[:600]}")
+        odyssey = [f for f in films if matches_any(f, cfg.get("movieMatch") or [])]
+        log(f"  Odyssey titles showing today at this theatre: {odyssey or 'none'}")
+
+    raw_dump: dict = {"control": control}
     strict_keys: set[str] = set()
     total_sessions = 0
 

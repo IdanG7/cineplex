@@ -272,5 +272,53 @@ class TestDescribeShape(unittest.TestCase):
         self.assertEqual(w.describe_shape("hi"), "str")
 
 
+class TestEmptyBodyHandling(unittest.TestCase):
+    """A date with nothing on it comes back as an empty body, not an empty
+    array. That crashed the run with a JSONDecodeError -- fatal for a watcher
+    whose normal state is 'nothing yet' for weeks."""
+
+    class FakeResponse:
+        def __init__(self, body, status=200, ctype="application/json"):
+            self._body = body
+            self.status = status
+            self.headers = {"Content-Type": ctype}
+
+        def read(self):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def setUp(self):
+        self._real = w.urllib.request.urlopen
+
+    def tearDown(self):
+        w.urllib.request.urlopen = self._real
+
+    def _serve(self, body, **kw):
+        w.urllib.request.urlopen = lambda req, timeout=None: self.FakeResponse(body, **kw)
+        return w.http_get_json("https://example.com/x")
+
+    def test_empty_body_becomes_an_empty_dict(self):
+        self.assertEqual(self._serve(b""), {})
+
+    def test_whitespace_only_body_becomes_an_empty_dict(self):
+        self.assertEqual(self._serve(b"   \n  "), {})
+
+    def test_valid_json_still_parses(self):
+        self.assertEqual(self._serve(b'{"dates": []}'), {"dates": []})
+
+    def test_genuinely_broken_json_still_raises(self):
+        with self.assertRaises(json.JSONDecodeError):
+            self._serve(b"<html>nope</html>")
+
+    def test_an_empty_response_yields_no_matches_rather_than_an_error(self):
+        self.assertEqual(w.find_matches({}, "7420", "T", CONFIG), [])
+        self.assertEqual(w.extract_days({}), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
