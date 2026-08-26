@@ -2,9 +2,19 @@ name: Watch Odyssey tickets
 
 on:
   schedule:
-    # Every 5 minutes. GitHub delays scheduled runs under load, so treat this
-    # as "roughly every 5-15 minutes" rather than a guarantee.
-    - cron: "*/5 * * * *"
+    # Every 15 minutes, deliberately off the boundary.
+    #
+    # This was */5 and produced one run in 75 minutes. Five minutes is the
+    # shortest interval GitHub allows, and at that edge the scheduler drops
+    # ticks rather than merely delaying them: the single run we did get
+    # arrived at 02:54:01, which is the 02:50 tick four minutes late.
+    #
+    # :00 is also the busiest minute of the hour, so every */5 tick competed
+    # with every other repo on the platform. Asking for less, at minutes
+    # nobody else picks, is far likelier to actually be honoured. The
+    # external cron in SETUP-CRON.md carries the 5-minute resolution; this is
+    # the backstop, and a backstop that runs beats one that does not.
+    - cron: "7,22,37,52 * * * *"
   # Escape hatch for GitHub's scheduler, which did not fire once in the first
   # hour on this repo. Any external cron can POST to the repository_dispatch
   # API with {"event_type": "poll"} and drive the watcher directly.

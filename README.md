@@ -217,8 +217,10 @@ showtimes were found.
 - **Alerts go only where you point them.** Until `NTFY_TOPIC` or `WEBHOOK_URL`
   is set, a run that finds showtimes logs them to the job summary and says no
   channel is configured. It does not fail, so set at least one secret.
-- **`*/5` is a request, not a promise.** GitHub delays scheduled runs under
-  load; 5–15 minutes is realistic.
+- **GitHub's scheduler is unreliable at high frequency.** `*/5` produced one
+  run in 75 minutes here; the schedule is now every 15 minutes at off-boundary
+  minutes, which the scheduler is far likelier to honour. For 5-minute
+  resolution use the external cron in [SETUP-CRON.md](SETUP-CRON.md).
 - **A failed run emails you** (GitHub does this by default for your own repos),
   which is the backstop for the watcher breaking rather than the tickets never
   appearing.
