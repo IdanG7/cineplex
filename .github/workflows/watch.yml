@@ -30,7 +30,12 @@ on:
 
 concurrency:
   group: cineplex-watch
-  cancel-in-progress: false
+  # A poller wants the freshest reading, never a backlog of stale ones. With
+  # queueing, one run that cannot get a hosted runner sits there for fifteen
+  # minutes and every poll behind it either waits or gets evicted -- which is
+  # exactly what happened at a one-minute cadence. Superseding instead means a
+  # stuck run costs one poll rather than fifteen.
+  cancel-in-progress: true
 
 permissions:
   contents: write

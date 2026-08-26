@@ -91,7 +91,7 @@ card.
 | --- | --- |
 | Title | `Cineplex Odyssey watcher` |
 | URL | `https://api.github.com/repos/IdanG7/cineplex/dispatches` |
-| Schedule | Every 1 minute |
+| Schedule | Every 5 minutes |
 | Request method | **POST** |
 
 Then open **Advanced / Headers** and add:
@@ -128,24 +128,51 @@ matter how many triggers fire.
 ## Cost
 
 The repository is public, so Actions minutes are free and unlimited. At every
-minute that is ~1,440 runs a day, each about ten seconds — roughly two seconds
-of watcher plus checkout and the state commit.
+five minutes that is ~288 runs a day, each about fifteen seconds — roughly two
+seconds of watcher plus checkout and the state commit.
 
-## What a one-minute cadence changes
+## Do not go below five minutes on GitHub Actions
 
-Polling every minute is what actually decides whether you get the seats: the
-watcher itself runs in about two seconds, so essentially all of the delay
-between tickets opening and your phone buzzing is the gap between polls. Going
-from five minutes to one cuts the average delay from ~150 seconds to ~30.
+This was tried and it broke. Five minutes ran 86 consecutive green runs at
+13–27 seconds each; switching the cron to one minute produced, within half an
+hour, four outright failures, four `startup_failure`s, three cancellations and
+three runs stuck in the queue for over twenty minutes. The annotation on the
+failures says it plainly:
 
-Three things in this repo are set up for that rate specifically:
+> The job was not acquired by Runner of type hosted even after multiple attempts
 
-- **`timeout-minutes: 3` on the job.** The `concurrency` group keeps at most
-  one run pending, so a hung run blocks every poll queued behind it. A short
-  timeout caps that at three missed polls instead of ten.
+The watcher is not the bottleneck — it finishes in about two seconds. The cost
+is the *runner allocation*: a one-minute cadence asks GitHub for ~1,440 hosted
+runners a day and the free pool throttles it. Nothing in this repository can
+fix that, because the failure happens before any step of the job runs.
+
+Note that `timeout-minutes` does not help here. It governs a job that is
+running too long, not one that never acquired a runner, which is why those
+failures sat for fifteen minutes with a three-minute timeout configured.
+
+**If you genuinely need sub-minute detection, GitHub Actions is the wrong
+vehicle.** A poll is a two-second Python call with no dependencies; run it from
+a machine that is already on — a laptop, a Raspberry Pi, a cheap VPS — in a
+`while true; do python3 cineplex_watch.py; sleep 30; done` loop, and there is
+no runner to allocate at all. Actions is the right home for a five-minute
+watch, not a thirty-second one.
+
+## What the five-minute cadence relies on
+
+The watcher runs in about two seconds, so essentially all of the delay between
+tickets opening and your phone buzzing is the gap between polls: ~150 seconds
+on average at five minutes.
+
+Three things in this repo are set up for that:
+
+- **`cancel-in-progress: true`.** A poller wants the freshest reading, never a
+  backlog of stale ones. Queueing meant one run that could not get a runner
+  blocked every poll behind it; superseding costs one poll instead.
+- **`timeout-minutes: 3` on the job.** Caps the damage from a job that hangs
+  once it *is* running. (It does nothing for runner acquisition — see above.)
 - **No `setup-python` step.** `ubuntu-latest` already ships 3.12 and the
   watcher has no dependencies; provisioning a second copy spent 10–20 seconds
-  of a 60-second budget to change nothing.
+  to change nothing.
 - **`escalate.maxMinutes`, not a repeat count.** The buy-now alert repeats for
   a number of *minutes*, because the polling rate lives at cron-job.org where
   nothing in this repo can see it change. A count of repeats would silently
