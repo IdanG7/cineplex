@@ -5,8 +5,12 @@ parser against a fixture shaped like the live response.
 """
 
 import json
+import os
+import shutil
 import sys
+import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -767,6 +771,546 @@ class TestAlertFormatting(unittest.TestCase):
         title, _b, _l = w.build_message([self._hit(seatReport={})], CONFIG)
         self.assertIn("1 showtime", title)
         self.assertNotIn("1 showtimes", title)
+
+
+class TestRealSeatMaps(unittest.TestCase):
+    """The seat maps as Cineplex actually returns them.
+
+    Everything above this point runs on a synthetic auditorium, which only ever
+    proves the ranker is self-consistent. These two are verbatim captures of
+    `seat-layout` and `seat-availability` for real showings at Mississauga
+    Square One -- one IMAX 70mm house, one UltraAVX house with a D-BOX block --
+    and they are what proves the ranker can read the real thing.
+    """
+
+    @staticmethod
+    def house(name):
+        layout = json.loads((ROOT / "tests" / "fixtures" / f"seat_layout_{name}.json").read_text())
+        avail = json.loads((ROOT / "tests" / "fixtures" / f"seat_availability_{name}.json").read_text())
+        return layout, avail
+
+    def setUp(self):
+        self.imax = self.house("imax70")
+        self.dbox = self.house("dbox")
+
+    # -- the shape of the real response ------------------------------------
+
+    def test_availability_is_keyed_by_the_seat_ids_the_layout_uses(self):
+        layout, avail = self.imax
+        statuses = w.availability_map(avail)
+        ids = {s["id"] for _n, _a, rows in w.seat_areas(layout) for r in rows for s in r["seats"]}
+        self.assertEqual(len(ids), 263)
+        self.assertEqual(ids - set(statuses), set(), "layout seats missing from availability")
+
+    def test_the_real_statuses_are_read_correctly(self):
+        seen = set()
+        for layout, avail in (self.imax, self.dbox):
+            del layout
+            seen |= set(w.availability_map(avail).values())
+        self.assertEqual(seen, {"Available", "Occupied", "Broken"})
+        self.assertFalse(w.seat_is_taken("Available"))
+        self.assertTrue(w.seat_is_taken("Occupied"))
+        self.assertTrue(w.seat_is_taken("Broken"))
+
+    def test_the_real_seat_types_cover_the_avoid_list(self):
+        layout, _avail = self.dbox
+        types = {s["type"] for _n, _a, rows in w.seat_areas(layout) for r in rows for s in r["seats"]}
+        self.assertEqual(types, {"Standard", "Wheelchair", "Companion"})
+        avoid = CONFIG["seats"]["avoidSeatTypes"]
+        self.assertTrue(all(any(a in t.lower() for a in avoid) for t in types - {"Standard"}))
+
+    def test_a_row_with_no_label_and_no_seats_does_not_break_the_ranker(self):
+        layout, avail = self.imax
+        rows = w.seat_areas(layout)[0][2]
+        self.assertNotIn(None, [r["label"] for r in rows], "the spacer row should be dropped")
+        self.assertTrue(w.rank_seat_blocks(layout, avail, CONFIG))
+
+    # -- every seating area, not just the first ----------------------------
+
+    def test_both_areas_of_the_ultraavx_house_are_read(self):
+        layout, _avail = self.dbox
+        areas = dict((n, rows) for n, _a, rows in w.seat_areas(layout))
+        self.assertEqual(sorted(areas), ["dboxSeats", "standardSeats"])
+        seats = sum(len(r["seats"]) for rows in areas.values() for r in rows)
+        self.assertEqual(seats, 331, "the 28 D-BOX seats must not go missing")
+
+    def test_the_dbox_block_is_the_centre_of_the_row_the_standard_area_only_stubs(self):
+        layout, _avail = self.dbox
+        areas = {n: (a, rows) for n, a, rows in w.seat_areas(layout)}
+        std_area, std_rows = areas["standardSeats"]
+        dbx_area, dbx_rows = areas["dboxSeats"]
+        std_h = next(r for r in std_rows if r["label"] == "H")
+        dbx_h = next(r for r in dbx_rows if r["label"] == "H")
+
+        # Same physical row: four seats by the walls, ten in the middle.
+        self.assertEqual(w.row_depth(std_area, std_h, 14), w.row_depth(dbx_area, dbx_h, 0))
+        stubs = sorted(w.seat_x(std_area, s) for s in std_h["seats"])
+        centre = sorted(w.seat_x(dbx_area, s) for s in dbx_h["seats"])
+        self.assertLess(stubs[1], centre[0])
+        self.assertGreater(stubs[2], centre[-1])
+
+    def test_a_dbox_block_is_labelled_as_dbox_in_the_alert(self):
+        layout, avail = self.dbox
+        block = next(b for b in w.rank_seat_blocks(layout, avail, CONFIG) if b["area"] == "dboxSeats")
+        self.assertIn("D-BOX", w.seat_quality(block))
+
+    def test_an_ordinary_block_carries_no_premium_tag(self):
+        layout, avail = self.imax
+        self.assertNotIn("D-BOX", w.seat_quality(w.rank_seat_blocks(layout, avail, CONFIG)[0]))
+
+    # -- the geometry the ranking depends on -------------------------------
+
+    def test_the_house_frame_comes_from_the_house_not_the_widest_row(self):
+        layout, _avail = self.imax
+        rows, centre, half = w.house_frame(layout, w.seat_areas(layout))
+        self.assertEqual((rows, centre, half), (11.0, 14.5, 14.5))
+
+    def test_centring_is_measured_from_the_screen_not_from_the_ragged_row(self):
+        """Row A runs columns 3-22 in a house 0-28, so its own midpoint sits a
+        seat and a half left of the screen. Rank against that and you recommend
+        the wrong seats."""
+        layout, avail = self.imax
+        _rows, centre, _half = w.house_frame(layout, w.seat_areas(layout))
+        area, rows = next((a, r) for _n, a, r in w.seat_areas(layout))
+        row_a = next(r for r in rows if r["label"] == "A")
+        xs = [w.seat_x(area, s) for s in row_a["seats"]]
+        self.assertAlmostEqual((min(xs) + max(xs)) / 2, centre - 1.5)
+
+        # Of the blocks row A can seat, the ranker must prefer the one nearest
+        # the screen centre -- not the one nearest row A's own lopsided middle.
+        free = w.bookable_seats(area, row_a, w.availability_map(avail),
+                                CONFIG["seats"]["avoidSeatTypes"])
+        candidates = w.contiguous_blocks(free, CONFIG["seats"]["partySize"])
+        self.assertGreater(len(candidates), 1)
+        mid = lambda b: (w.seat_x(area, b[0]) + w.seat_x(area, b[-1])) / 2
+        nearest = min(candidates, key=lambda b: abs(mid(b) - centre))
+        row_relative = min(candidates, key=lambda b: abs(mid(b) - (min(xs) + max(xs)) / 2))
+        self.assertNotEqual([s["label"] for s in nearest], [s["label"] for s in row_relative],
+                            "this row must actually distinguish the two rules")
+
+        best_in_a = next(b for b in w.rank_seat_blocks(layout, avail, CONFIG) if b["row"] == "A")
+        self.assertEqual(best_in_a["seats"], w.seat_labels(nearest))
+
+    def test_row_depth_runs_front_to_back_from_the_screen(self):
+        layout, _avail = self.imax
+        area, rows = next((a, r) for _n, a, r in w.seat_areas(layout))
+        depths = {r["label"]: w.row_depth(area, r, i) for i, r in enumerate(rows)}
+        self.assertLess(depths["A"], depths["E"])
+        self.assertLess(depths["E"], depths["J"])
+
+    # -- the answer --------------------------------------------------------
+
+    def test_the_party_of_six_gets_six_adjacent_real_seats(self):
+        layout, avail = self.dbox
+        statuses = w.availability_map(avail)
+        labels = {s["label"]: s for _n, _a, rows in w.seat_areas(layout)
+                  for r in rows for s in r["seats"]}
+        for block in w.rank_seat_blocks(layout, avail, CONFIG)[:25]:
+            self.assertEqual(len(block["seats"]), 6)
+            for label in block["seats"]:
+                self.assertIn(label, labels, "recommended a seat that does not exist")
+                self.assertFalse(w.seat_is_taken(statuses.get(labels[label]["id"])))
+                self.assertEqual(labels[label]["type"], "Standard")
+
+    def test_the_top_block_of_the_ultraavx_house_is_where_you_would_choose_to_sit(self):
+        layout, avail = self.dbox
+        best = w.rank_seat_blocks(layout, avail, CONFIG)[0]
+        self.assertEqual(w.seat_quality(best), "ideal")
+        self.assertAlmostEqual(best["rowFraction"], 0.65, delta=0.08)
+        self.assertLess(best["centreOffset"], 0.1)
+
+    def test_a_picked_over_house_is_reported_honestly_rather_than_flattered(self):
+        """39 of 263 seats left, all of them down the front. Six together only
+        exists in rows A and B, and the alert has to say so."""
+        layout, avail = self.imax
+        best = w.rank_seat_blocks(layout, avail, CONFIG)[0]
+        self.assertIn(best["row"], ("A", "B"))
+        self.assertEqual(w.seat_quality(best), "front row")
+
+    def test_the_longest_run_is_the_real_one(self):
+        layout, avail = self.imax
+        self.assertEqual(w.largest_run(layout, avail, CONFIG), 10)
+
+    def test_seat_labels_are_printed_in_seating_order(self):
+        for name in ("imax70", "dbox"):
+            layout, avail = self.house(name)
+            for block in w.rank_seat_blocks(layout, avail, CONFIG):
+                numbers = [int(s.lstrip(block["row"])) for s in block["seats"]]
+                self.assertEqual(numbers, sorted(numbers), f"{name}: {block['seats']}")
+
+
+class TestTheatreCatalogue(unittest.TestCase):
+    """`nearbyTheatres` is computed from the caller's IP, so reading only the
+    first list in the response returns a handful of theatres that depend on
+    where the run happens to execute -- and drops a configured one silently."""
+
+    PAYLOAD = {
+        "favouriteTheatres": [],
+        "nearbyTheatres": [{"theatreId": 7408, "theatreName": "Cineplex Cinemas Vaughan"}],
+        "otherTheatres": [
+            {"theatreId": 7420, "theatreName": "Cineplex Cinemas Mississauga Square One"},
+            {"theatreId": 7408, "theatreName": "Cineplex Cinemas Vaughan"},
+        ],
+    }
+
+    class Stub:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def get(self, _path, _params):
+            return self.payload
+
+    def test_every_list_in_the_response_is_read(self):
+        got = w.list_theatres(self.Stub(self.PAYLOAD))
+        self.assertEqual([t["theatreId"] for t in got], [7408, 7420])
+
+    def test_a_theatre_listed_twice_is_only_counted_once(self):
+        self.assertEqual(len(w.list_theatres(self.Stub(self.PAYLOAD))), 2)
+
+    def test_both_configured_theatres_resolve(self):
+        resolved = w.resolve_theatres(self.Stub(self.PAYLOAD), CONFIG)
+        self.assertEqual(sorted(tid for tid, _n in resolved), ["7408", "7420"])
+
+    def test_an_unrecognisable_response_is_empty_rather_than_an_error(self):
+        self.assertEqual(w.list_theatres(self.Stub({"error": "nope"})), [])
+
+
+def block(row="G", first=12, size=6, score=0.01, area="standardSeats"):
+    return {"row": row, "area": area, "score": score, "rowFraction": 0.65, "centreOffset": 0.03,
+            "seats": [f"{row}{n}" for n in range(first, first + size)]}
+
+
+class TestEscalationTarget(unittest.TestCase):
+    """Which block is worth waking someone up for."""
+
+    SPEC = CONFIG["escalate"]
+
+    def test_the_seats_we_actually_want_qualify(self):
+        for row in ("F", "G"):
+            for first in (11, 12, 13, 14):
+                self.assertTrue(w.block_is_target(block(row, first), self.SPEC), f"{row}{first}")
+
+    def test_the_wrong_row_does_not_qualify(self):
+        for row in ("A", "E", "H", "J"):
+            self.assertFalse(w.block_is_target(block(row, 12), self.SPEC), row)
+
+    def test_a_block_running_past_the_span_does_not_qualify(self):
+        self.assertFalse(w.block_is_target(block("G", 15), self.SPEC))  # G15-G20
+        self.assertFalse(w.block_is_target(block("G", 10), self.SPEC))  # G10-G15
+
+    def test_the_span_is_wider_than_the_party_on_purpose(self):
+        """A rule narrow enough to name one exact block goes silent the moment a
+        single seat at its edge is taken."""
+        self.assertTrue(w.block_is_target(block("G", 12), self.SPEC))
+        self.assertTrue(w.block_is_target(block("G", 13), self.SPEC))
+        self.assertTrue(w.block_is_target(block("G", 11), self.SPEC))
+
+    def test_no_spec_means_nothing_is_ever_a_target(self):
+        self.assertFalse(w.block_is_target(block(), {}))
+        self.assertFalse(w.block_is_target(block(), None))
+
+    def test_labels_with_no_number_cannot_be_judged_against_a_span(self):
+        odd = {"row": "G", "seats": ["GW", "GW", "GW", "GW", "GW", "GW"]}
+        self.assertFalse(w.block_is_target(odd, self.SPEC))
+
+    def test_the_row_is_matched_case_insensitively(self):
+        self.assertTrue(w.block_is_target(block("g", 12), self.SPEC))
+
+    def test_the_real_imax_house_offers_a_target_when_it_opens(self):
+        """The whole point: on an empty Sept 17 house, F/G 11-19 is there."""
+        layout = json.loads((ROOT / "tests" / "fixtures" / "seat_layout_imax70.json").read_text())
+        ranked = w.rank_seat_blocks(layout, {}, CONFIG)
+        target = next((b for b in ranked if w.block_is_target(b, self.SPEC)), None)
+        self.assertIsNotNone(target)
+        self.assertIn(target["row"], ("F", "G"))
+
+    def test_the_picked_over_house_offers_no_target(self):
+        """Same house as it is today -- row A only. Nothing to shout about."""
+        layout = json.loads((ROOT / "tests" / "fixtures" / "seat_layout_imax70.json").read_text())
+        avail = json.loads((ROOT / "tests" / "fixtures" / "seat_availability_imax70.json").read_text())
+        ranked = w.rank_seat_blocks(layout, avail, CONFIG)
+        self.assertFalse([b for b in ranked if w.block_is_target(b, self.SPEC)])
+
+
+class TestSubscriptionKey(unittest.TestCase):
+    """A pinned key is a floor under the scraper, not a substitute for it.
+
+    Getting this order wrong is subtle: overriding with a pinned key looks like
+    the fast, safe choice, and is in fact the only version that can go stale."""
+
+    def setUp(self):
+        self._env, self._discover = dict(os.environ), w.discover_subscription_key
+        os.environ.pop("CINEPLEX_API_KEY", None)
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self._env)
+        w.discover_subscription_key = self._discover
+
+    def test_the_scraped_key_wins_because_it_is_always_current(self):
+        os.environ["CINEPLEX_API_KEY"] = "stale" * 6
+        w.discover_subscription_key = lambda *a, **k: "fresh"
+        self.assertEqual(w.get_subscription_key(), "fresh")
+
+    def test_a_broken_scraper_falls_back_instead_of_going_dark(self):
+        os.environ["CINEPLEX_API_KEY"] = "pinned"
+        def boom(*a, **k):
+            raise RuntimeError("no JS chunk referenced the theatrical API")
+        w.discover_subscription_key = boom
+        self.assertEqual(w.get_subscription_key(), "pinned")
+
+    def test_with_no_fallback_a_broken_scraper_is_loud(self):
+        def boom(*a, **k):
+            raise RuntimeError("bundles moved")
+        w.discover_subscription_key = boom
+        with self.assertRaises(RuntimeError):
+            w.get_subscription_key()
+
+    def test_an_empty_fallback_is_not_a_fallback(self):
+        os.environ["CINEPLEX_API_KEY"] = "   "
+        def boom(*a, **k):
+            raise RuntimeError("bundles moved")
+        w.discover_subscription_key = boom
+        with self.assertRaises(RuntimeError):
+            w.get_subscription_key()
+
+
+class TestEscalationWindow(unittest.TestCase):
+    """The shouting window is wall-clock time, not a count of polls -- the
+    cadence lives at cron-job.org, where nothing here can see it change."""
+
+    @staticmethod
+    def ago(minutes):
+        return (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
+
+    def test_a_fresh_escalation_is_inside_the_window(self):
+        self.assertTrue(w.within_escalation_window(None, 120))
+        self.assertTrue(w.within_escalation_window({"since": self.ago(0)}, 120))
+
+    def test_an_escalation_still_inside_its_two_hours_keeps_going(self):
+        self.assertTrue(w.within_escalation_window({"since": self.ago(119)}, 120))
+
+    def test_an_escalation_past_its_window_stands_down(self):
+        self.assertFalse(w.within_escalation_window({"since": self.ago(121)}, 120))
+
+    def test_the_window_does_not_change_when_the_poll_rate_does(self):
+        """The whole point: 24 repeats meant 2 hours at a 5-minute poll and 24
+        minutes at a 1-minute poll. Minutes mean minutes at any cadence."""
+        entry = {"since": self.ago(90)}
+        self.assertTrue(w.within_escalation_window(entry, 120))
+        self.assertFalse(w.within_escalation_window(entry, 60))
+
+    def test_an_unreadable_timestamp_errs_towards_still_alerting(self):
+        for entry in ({"since": "not a date"}, {"since": None}, {}):
+            self.assertTrue(w.within_escalation_window(entry, 120), entry)
+
+
+class TestGoMessage(unittest.TestCase):
+    def hit(self, key="k1", start="2026-09-17T19:00:00", target=None, theatre="Cineplex Cinemas Vaughan"):
+        return {"key": key, "theatreId": "7408", "theatre": theatre, "date": "2026-09-17",
+                "start": start, "movie": "The Odyssey", "format": "IMAX 70mm",
+                "seatsRemaining": 269, "isSoldOut": False,
+                "url": f"https://apis.cineplex.com/deeplink?s={key}",
+                "seatReport": {"readable": True, "blocks": [], "largest": 29,
+                               "target": target or block()}}
+
+    def setUp(self):
+        self._env = dict(os.environ)
+        os.environ["NTFY_TOPIC"] = "test-topic"
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self._env)
+
+    def test_the_title_says_which_seats_and_is_unmistakable(self):
+        title, _b, _l, _a = w.go_message([self.hit()], CONFIG)
+        self.assertIn("BUY NOW", title)
+        self.assertIn("G12-G17", title)
+
+    def test_the_link_is_the_deeplink_of_the_best_showtime(self):
+        worse = self.hit(key="k2", start="2026-09-17T13:00:00", target=block("F", 14, score=0.9))
+        better = self.hit(key="k1", start="2026-09-17T19:00:00", target=block("G", 12, score=0.01))
+        _t, _b, link, actions = w.go_message([worse, better], CONFIG)
+        self.assertEqual(link, better["url"])
+        self.assertEqual(actions[0], {"action": "view", "label": "Buy now",
+                                      "url": better["url"], "clear": True})
+
+    def test_the_body_marks_the_one_to_tap(self):
+        worse = self.hit(key="k2", start="2026-09-17T13:00:00", target=block("F", 14, score=0.9))
+        better = self.hit(key="k1", start="2026-09-17T19:00:00", target=block("G", 12, score=0.01))
+        _t, body, _l, _a = w.go_message([worse, better], CONFIG)
+        marked = [ln for ln in body.splitlines() if "tap Buy now" in ln]
+        self.assertEqual(len(marked), 1)
+        self.assertIn("G12-G17", marked[0])
+
+    def test_it_does_not_pretend_the_seats_are_held(self):
+        _t, body, _l, _a = w.go_message([self.hit()], CONFIG)
+        self.assertIn("Nothing is held", body)
+
+    def test_there_is_a_one_tap_way_to_stop_the_shouting(self):
+        _t, _b, _l, actions = w.go_message([self.hit()], CONFIG)
+        ack = [a for a in actions if a["label"] == "Got it"][0]
+        self.assertEqual(ack["method"], "POST")
+        self.assertTrue(ack["url"].endswith("/test-topic-ack"))
+
+    def test_with_no_ntfy_topic_there_is_no_ack_button(self):
+        del os.environ["NTFY_TOPIC"]
+        _t, _b, _l, actions = w.go_message([self.hit()], CONFIG)
+        self.assertEqual([a["label"] for a in actions], ["Buy now"])
+
+
+class TestAcknowledgement(unittest.TestCase):
+    def setUp(self):
+        self._env, self._get = dict(os.environ), w.http_get
+        os.environ["NTFY_TOPIC"] = "test-topic"
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self._env)
+        w.http_get = self._get
+
+    def test_a_message_on_the_ack_topic_counts_as_acknowledged(self):
+        w.http_get = lambda url, headers=None, timeout=30: (
+            b'{"id":"x","event":"message","message":"ack"}\n')
+        self.assertTrue(w.acknowledged_since("2026-09-17T00:00:00+00:00"))
+
+    def test_an_empty_ack_topic_is_not_an_acknowledgement(self):
+        w.http_get = lambda url, headers=None, timeout=30: b""
+        self.assertFalse(w.acknowledged_since("2026-09-17T00:00:00+00:00"))
+
+    def test_keepalives_are_not_acknowledgements(self):
+        w.http_get = lambda url, headers=None, timeout=30: (
+            b'{"id":"x","event":"keepalive"}\n{"id":"y","event":"open"}\n')
+        self.assertFalse(w.acknowledged_since("2026-09-17T00:00:00+00:00"))
+
+    def test_an_unreachable_ntfy_fails_closed(self):
+        """An ack that cannot be read must never silence an alert nobody saw."""
+        def boom(*a, **k):
+            raise OSError("ntfy down")
+        w.http_get = boom
+        self.assertFalse(w.acknowledged_since("2026-09-17T00:00:00+00:00"))
+
+    def test_no_topic_configured_is_never_acknowledged(self):
+        del os.environ["NTFY_TOPIC"]
+        self.assertFalse(w.acknowledged_since("2026-09-17T00:00:00+00:00"))
+
+
+class TestEscalationLoop(unittest.TestCase):
+    """The state machine, as it runs: a fresh container every five minutes that
+    remembers nothing except `state/seen.json`."""
+
+    def setUp(self):
+        self.sent = []
+        self.acked = False
+        self._notify, self._ack = w.notify, w.acknowledged_since
+        w.notify = lambda t, b, l, actions=None: self.sent.append((t, b, l, actions)) or 1
+        w.acknowledged_since = lambda since: self.acked
+        self.dir = tempfile.mkdtemp(prefix="escal-")
+        self.state_path = Path(self.dir) / "seen.json"
+
+    def tearDown(self):
+        w.notify, w.acknowledged_since = self._notify, self._ack
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def hit(self, key="k1", target=True):
+        report = {"readable": True, "blocks": [block()], "largest": 29,
+                  "target": block() if target else None}
+        return {"key": key, "theatreId": "7408", "theatre": "Cineplex Cinemas Vaughan",
+                "date": "2026-09-17", "start": "2026-09-17T19:00:00", "movie": "The Odyssey",
+                "format": "IMAX 70mm", "seatsRemaining": 269, "isSoldOut": False,
+                "url": "https://apis.cineplex.com/deeplink?s=1", "seatReport": report}
+
+    def poll(self, hits, fresh=None, state=None):
+        state = state if state is not None else w.load_state(self.state_path)
+        escalating = dict(state.get("escalating") or {})
+        already = set(state.get("alerted") or [])
+        fresh = [h for h in hits if h["key"] not in already] if fresh is None else fresh
+        w.dispatch(hits, fresh, escalating, CONFIG, state, self.state_path, already, False)
+        return w.load_state(self.state_path)
+
+    def test_the_first_sighting_of_the_target_seats_escalates(self):
+        state = self.poll([self.hit()])
+        self.assertIn("BUY NOW", self.sent[0][0])
+        self.assertEqual(state["escalating"]["k1"]["sent"], 1)
+        self.assertEqual(state["escalating"]["k1"]["seats"], "G12-G17")
+
+    def test_it_keeps_shouting_while_the_seats_are_there_and_nobody_answers(self):
+        state = self.poll([self.hit()])
+        for expected in (2, 3, 4):
+            state = self.poll([self.hit()], state=state)
+            self.assertEqual(state["escalating"]["k1"]["sent"], expected)
+        self.assertEqual(len(self.sent), 4)
+
+    def test_one_tap_stops_every_showtime(self):
+        state = self.poll([self.hit("k1"), self.hit("k2")])
+        self.assertEqual(len(state["escalating"]), 2)
+        self.acked = True
+        state = self.poll([self.hit("k1"), self.hit("k2")], state=state)
+        self.assertEqual(state["escalating"], {})
+
+    def test_after_acknowledgement_it_stays_quiet(self):
+        state = self.poll([self.hit()])
+        self.acked = True
+        state = self.poll([self.hit()], state=state)
+        before = len(self.sent)
+        state = self.poll([self.hit()], state=state)
+        self.assertEqual(len(self.sent), before, "an acknowledged alert must not restart")
+
+    def test_seats_lost_mid_escalation_are_reported_not_swallowed(self):
+        state = self.poll([self.hit()])
+        state = self.poll([self.hit(target=False)], state=state)
+        self.assertEqual(state["escalating"], {})
+        self.assertIn("gone", self.sent[-1][0].lower())
+
+    def test_escalation_gives_up_after_the_configured_limit(self):
+        state = w.load_state(self.state_path)
+        state["escalating"] = {"k1": {"since": "2020-01-01T00:00:00+00:00", "sent": 3}}
+        state["alerted"] = ["k1"]
+        before = len(self.sent)
+        state = self.poll([self.hit()], state=state)
+        self.assertEqual(state["escalating"], {})
+        self.assertEqual(len(self.sent), before, "a spent escalation must go quiet, not loop")
+
+    def test_a_later_showtime_can_still_escalate_after_an_earlier_one_was_acknowledged(self):
+        """The ack settles what was shouting at the time, not the whole season.
+        A showtime Cineplex adds afterwards is news again."""
+        state = self.poll([self.hit("k1")])
+        self.acked = True
+        state = self.poll([self.hit("k1")], state=state)
+        self.acked = False
+        before = len(self.sent)
+        state = self.poll([self.hit("k1"), self.hit("k2")], state=state)
+        self.assertEqual(len(self.sent), before + 1)
+        self.assertEqual(list(state["escalating"]), ["k2"])
+
+    def test_a_spent_escalation_does_not_restart_on_the_next_poll(self):
+        state = w.load_state(self.state_path)
+        state["escalating"] = {"k1": {"since": "2020-01-01T00:00:00+00:00", "sent": 3}}
+        state["alerted"] = ["k1"]
+        state = self.poll([self.hit()], state=state)
+        before = len(self.sent)
+        state = self.poll([self.hit()], state=state)
+        self.assertEqual(len(self.sent), before)
+        self.assertEqual(state["escalating"], {})
+
+    def test_a_showtime_with_no_target_seats_gets_the_ordinary_alert(self):
+        state = self.poll([self.hit(target=False)])
+        self.assertNotIn("BUY NOW", self.sent[0][0])
+        self.assertEqual(state["escalating"], {})
+        self.assertEqual(state["alerted"], ["k1"])
+
+    def test_an_escalating_showtime_is_re_examined_even_though_it_is_not_new(self):
+        """The seat map has to be re-read each poll; a showtime already
+        announced is exactly the one under escalation."""
+        state = self.poll([self.hit()])
+        state = self.poll([self.hit()], fresh=[], state=state)
+        self.assertEqual(state["escalating"]["k1"]["sent"], 2)
+
+    def test_a_dry_run_shouts_at_nobody_and_records_nothing(self):
+        state = w.load_state(self.state_path)
+        w.dispatch([self.hit()], [self.hit()], {}, CONFIG, state, self.state_path, set(), True)
+        self.assertEqual(self.sent, [])
+        self.assertFalse(self.state_path.exists())
 
 
 if __name__ == "__main__":

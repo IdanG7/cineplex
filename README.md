@@ -142,6 +142,36 @@ otherwise look identical.
 Two rules it will not break: a block never straddles an aisle (a gap in the
 column numbering), and accessible and companion seats are never recommended.
 
+### Reading the real seat map
+
+A Cineplex auditorium does not come back as one grid. `seat-layout` splits it
+into areas — `standardSeats`, `dboxSeats`, `balconySeats` — each carrying its
+own rows plus a `left`, `top` and `columnWidth` that place it in one shared
+house frame, and `totalRows`/`totalColumns` give that frame its size. Three
+things follow, and all three matter for which seats you are told to take:
+
+- **Every area is read, not just the first.** In the Square One UltraAVX house,
+  row H is four stub seats by the walls in `standardSeats` and ten D-BOX seats
+  filling the centre in `dboxSeats` — same physical row, two areas. Reading one
+  area hides 28 seats and leaves the ranker convinced row H seats four people.
+- **How far back a row sits comes from `top` + `number`,** not from its position
+  in a list. D-BOX row H is row 0 of its own area while sitting fourteen rows
+  back in the house.
+- **Centring is measured from the screen, not from the row.** Rows are ragged:
+  row A of the Square One IMAX runs columns 3–22 in a house 0–28, so a block
+  centred in its *own* row sits a seat and a half left of the screen. Using the
+  house centre also makes one row's centre penalty mean the same as another's,
+  which is the only reason ranking rows against each other means anything.
+
+A block in a premium area is labelled as such — `D-BOX · ideal` — because a
+D-BOX seat carries an upcharge and moves during the film, and recommending six
+of them without saying so is the same failure as recommending the front row
+without saying it is the front row.
+
+`tests/fixtures/seat_layout_*.json` are verbatim captures of both an IMAX 70mm
+house and an UltraAVX house with a D-BOX block, so the ranker is tested against
+the real response rather than an idea of it.
+
 Tune it in `watch.config.json`:
 
 ```jsonc
@@ -158,6 +188,73 @@ Tune it in `watch.config.json`:
 If the seat map cannot be read, the alert still goes out — it just falls back
 to telling you to pick 6 together, centre, two thirds back. Losing the alert
 because the seat API hiccuped would be the worst possible failure.
+
+## The buy-now alert
+
+Most of the time a showtime opening is news you read when you wake up. Once,
+it is news you have to act on — the moment 17 Sept goes on sale with F/G 12–17
+still free. That case gets its own alert.
+
+```jsonc
+"escalate": {
+  "rows": ["F", "G"],   // the rows worth waking up for
+  "seats": [11, 19],    // a block must sit entirely inside this span
+  "maxMinutes": 120     // how long it may keep shouting before standing down
+}
+```
+
+When a ranked block clears that bar, the watcher sends a differently-shaped
+notification: title `BUY NOW — F12-F17 open for Thu 17 Sep`, the one showtime
+to act on first, and a **Buy now** button that opens that showtime's seat
+picker directly. It repeats every poll until you answer.
+
+The seat span is deliberately wider than the party. With `[11, 19]` a party of
+six qualifies at 12–17, 13–18 or 11–16 — a rule narrow enough to name one exact
+block goes silent the moment a single seat at its edge is taken, which is the
+opposite of the point.
+
+**Stopping it.** The notification carries a **Got it** button that publishes to
+`$NTFY_TOPIC-ack`. The watcher reads that topic on its next poll and stands
+down. One tap silences every showtime that was shouting, because you are only
+going to buy one of them. The acknowledgement is permanent for those showtimes
+— without that, the next poll sees the same free seats and starts over, which
+turns a stop button into a snooze button. A showtime Cineplex adds afterwards
+is news again and can escalate on its own.
+
+It stands down on its own in three other cases: the seats stop being free (you
+get one plain message saying so, rather than silence after being told to go and
+buy them), `maxMinutes` elapses, or ntfy is unreachable — which counts as *not*
+acknowledged, so an unreadable ack topic can never silence an alert nobody saw.
+
+`maxMinutes` is wall-clock time rather than a count of polls on purpose. The
+polling rate is configured at cron-job.org, where nothing in this repo can see
+it change, so a repeat count would mean two hours at one cadence and twenty
+minutes at another without anything here looking different.
+
+### What it deliberately does not do
+
+It does not add anything to a cart and it does not buy anything. Nothing here
+touches your Cineplex login or your card, and no seat is held for you — you tap
+through to the seat picker and complete the purchase yourself.
+
+That is a deliberate limit, not a missing feature:
+
+- Movie tickets are non-refundable, and an auto-buyer that misfires buys six
+  seats at the wrong theatre, the wrong showtime, or in row A.
+- Cineplex's terms prohibit automated purchasing. The realistic downside is a
+  cancelled order or a locked account, on precisely the showing you were trying
+  to protect.
+
+The scarce thing is the seats, not the checkout. Going from notification to
+seat picker in one tap is where the time is actually won; your phone fills in
+the payment in the seconds after that.
+
+### One thing to know about the ack topic
+
+`$NTFY_TOPIC-ack` is a public ntfy topic, like the main one. Anyone who knows
+the name can publish to it and silence an escalation. The topic name is the
+only secret, so keep it out of screenshots — and note that a repository
+*variable* is not masked in workflow logs, while a *secret* is.
 
 ## Changing what it watches
 
