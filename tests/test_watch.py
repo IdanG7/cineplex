@@ -412,5 +412,147 @@ class TestCompressedResponses(unittest.TestCase):
         self.assertEqual(keys, {"HIT-A", "HIT-B", "HIT-C-TITLE-ONLY"})
 
 
+def auditorium(rows=15, cols=20, aisle_after=None):
+    """A synthetic IMAX house: `rows` rows labelled A.., `cols` seats each."""
+    out = []
+    for r in range(rows):
+        label = chr(ord("A") + r)
+        seats = []
+        for c in range(1, cols + 1):
+            column = c if not aisle_after or c <= aisle_after else c + 3
+            seats.append({"id": f"{label}{c}", "label": str(c), "column": column, "type": "standard"})
+        out.append({"label": label, "seats": seats})
+    return {"standardSeats": {"rows": out}}
+
+
+SEAT_CFG = {"seats": {"partySize": 5, "targetRowFraction": 0.65, "rowWeight": 1.0,
+                      "centerWeight": 0.8, "avoidSeatTypes": ["wheelchair", "companion"]}}
+
+
+class TestSeatRanking(unittest.TestCase):
+    def rank(self, layout=None, avail=None, cfg=None):
+        return w.rank_seat_blocks(layout or auditorium(), avail or {}, cfg or SEAT_CFG)
+
+    def test_best_block_sits_about_two_thirds_back(self):
+        best = self.rank()[0]
+        # 15 rows, target 0.65 -> row J is the closest row centre.
+        self.assertEqual(best["row"], "J")
+        self.assertAlmostEqual(best["rowFraction"], 9.5 / 15, places=3)
+
+    def test_best_block_is_centred_within_half_a_seat(self):
+        best = self.rank()[0]
+        cols = [int(s) for s in best["seats"]]
+        self.assertEqual(len(cols), 5)
+        # Row spans 1..20, centre 10.5; five seats cannot straddle it exactly.
+        self.assertLessEqual(abs((cols[0] + cols[-1]) / 2 - 10.5), 0.5)
+
+    def test_it_returns_five_adjacent_seats(self):
+        for block in self.rank()[:20]:
+            cols = [int(s) for s in block["seats"]]
+            self.assertEqual(cols, list(range(cols[0], cols[0] + 5)))
+
+    def test_a_block_never_straddles_an_aisle(self):
+        layout = auditorium(aisle_after=10)
+        for block in w.rank_seat_blocks(layout, {}, SEAT_CFG):
+            labels = [int(s) for s in block["seats"]]
+            self.assertFalse(min(labels) <= 10 < max(labels), f"straddles aisle: {labels}")
+
+    def test_taken_seats_are_excluded(self):
+        # Block out the centre of row J; the best block must move.
+        avail = {"seatAvailabilities": {f"J{c}": "Sold" for c in range(7, 15)}}
+        best = self.rank(avail=avail)[0]
+        if best["row"] == "J":
+            self.assertFalse(set(range(7, 15)) & {int(s) for s in best["seats"]})
+
+    def test_accessible_seats_are_not_recommended(self):
+        layout = auditorium()
+        for seat in layout["standardSeats"]["rows"][9]["seats"][7:13]:
+            seat["type"] = "Wheelchair"
+        best = self.rank(layout=layout)[0]
+        if best["row"] == "J":
+            self.assertFalse(set(range(8, 14)) & {int(s) for s in best["seats"]})
+
+    def test_front_and_back_rows_rank_worse_than_the_middle(self):
+        ranked = self.rank()
+        by_row = {}
+        for block in ranked:
+            by_row.setdefault(block["row"], block["score"])
+        self.assertLess(by_row["J"], by_row["A"])
+        self.assertLess(by_row["J"], by_row["O"])
+
+    def test_a_party_too_large_for_the_row_yields_nothing(self):
+        cfg = {"seats": dict(SEAT_CFG["seats"], partySize=40)}
+        self.assertEqual(w.rank_seat_blocks(auditorium(), {}, cfg), [])
+
+    def test_an_unreadable_layout_yields_nothing_rather_than_raising(self):
+        self.assertEqual(w.rank_seat_blocks({}, {}, SEAT_CFG), [])
+        self.assertEqual(w.rank_seat_blocks({"nope": 1}, {}, SEAT_CFG), [])
+
+
+class TestSeatHelpers(unittest.TestCase):
+    def test_showtime_id_from_the_obvious_field(self):
+        self.assertEqual(w.session_showtime_id({"vistaSessionId": "388367"}), "388367")
+
+    def test_showtime_id_falls_back_to_the_seat_map_url(self):
+        # Confirmed live: seatMapUrl carries ?theatreId=7420&showtimeId=388367
+        session = {"seatMapUrl": "https://www.cineplex.com/x?theatreId=7420&showtimeId=388367"}
+        self.assertEqual(w.session_showtime_id(session), "388367")
+
+    def test_showtime_id_falls_back_to_the_ticketing_url(self):
+        session = {"ticketingUrl": "https://apis.cineplex.com/x?VistaSessionId=99&LocationId=7420"}
+        self.assertEqual(w.session_showtime_id(session), "99")
+
+    def test_no_showtime_id_anywhere(self):
+        self.assertEqual(w.session_showtime_id({"auditorium": "1"}), "")
+
+    def test_taken_statuses(self):
+        for status in ("Sold", "SOLD_OUT", "occupied", "Unavailable", "broken", True):
+            self.assertTrue(w.seat_is_taken(status), status)
+
+    def test_free_statuses(self):
+        for status in ("Available", "empty", "0", None, False, "OK"):
+            self.assertFalse(w.seat_is_taken(status), status)
+
+    def test_availability_map_from_a_dict(self):
+        self.assertEqual(w.availability_map({"seatAvailabilities": {"A1": "Sold"}}), {"A1": "Sold"})
+
+    def test_availability_map_from_a_list(self):
+        got = w.availability_map({"seats": [{"id": "A1", "status": "Sold"}]})
+        self.assertEqual(got, {"A1": "Sold"})
+
+    def test_availability_map_from_a_bare_mapping(self):
+        self.assertEqual(w.availability_map({"A1": "Sold"}), {"A1": "Sold"})
+
+    def test_availability_map_on_junk(self):
+        self.assertEqual(w.availability_map(None), {})
+        self.assertEqual(w.availability_map([]), {})
+
+    def test_describe_seats_reads_like_an_instruction(self):
+        text = w.describe_seats({"row": "J", "seats": ["8", "9", "10", "11", "12"], "rowFraction": 0.633})
+        self.assertIn("row J", text)
+        self.assertIn("8-12", text)
+        self.assertIn("63% back", text)
+
+
+class TestSeatLookupIsFailSoft(unittest.TestCase):
+    """A seat lookup that fails must never cost the alert itself."""
+
+    def setUp(self):
+        self._real = w.http_get_json
+
+    def tearDown(self):
+        w.http_get_json = self._real
+
+    def test_a_failing_seat_api_returns_no_blocks_and_does_not_raise(self):
+        def boom(*a, **k):
+            raise OSError("ticketing API down")
+
+        w.http_get_json = boom
+        self.assertEqual(w.best_seats_for("7420", {"vistaSessionId": "1"}, SEAT_CFG), [])
+
+    def test_a_session_with_no_showtime_id_is_skipped_quietly(self):
+        self.assertEqual(w.best_seats_for("7420", {}, SEAT_CFG), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

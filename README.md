@@ -82,6 +82,48 @@ From the **Actions** tab, `Run workflow` gives you four modes:
 - **`dry-run`** — a real check that reports but neither alerts nor records.
 - **`test-notify`** — sends a test alert to confirm delivery.
 
+## Which seats it picks
+
+The alert does not just say a showtime opened — it says which seats to take.
+When a matching showtime appears the watcher pulls the live seat map from
+Cineplex's ticketing API (no auth needed) and ranks every run of 5 adjacent
+seats, best first.
+
+The ranking comes from how IMAX 1.43:1 is meant to be watched. The Odyssey is
+shot entirely in that ratio, so the frame is floor-to-ceiling tall:
+
+- **About two thirds back.** Far enough that the full height of the frame sits
+  inside your field of view without moving your head. Nolan's own advice is to
+  sit "a little behind the centre line"; the wider consensus for a ~15-row IMAX
+  house is rows 8–11. Too close and the image spills past your peripheral
+  vision and strains your neck; too far back and it stops enveloping you.
+- **Dead centre horizontally.** Centres you in the 12-channel audio field and
+  avoids the keystoning you get from the sides of a curved screen.
+
+Five is an awkward number: an odd block cannot straddle the centre of an
+even-width row, so the best it can do is half a seat off. The ranker accepts
+that rather than giving up the right row.
+
+Two rules it will not break: a block never straddles an aisle (a gap in the
+column numbering), and accessible and companion seats are never recommended.
+
+Tune it in `watch.config.json`:
+
+```jsonc
+"seats": {
+  "partySize": 5,
+  "targetRowFraction": 0.65,   // 0 = front row, 1 = back row
+  "rowWeight": 1.0,            // how much row position matters
+  "centerWeight": 0.8,         // ...versus being centred
+  "avoidSeatTypes": ["wheelchair", "companion"],
+  "topN": 3                    // how many options to name in the alert
+}
+```
+
+If the seat map cannot be read, the alert still goes out — it just falls back
+to telling you to pick 5 together, centre, two thirds back. Losing the alert
+because the seat API hiccuped would be the worst possible failure.
+
 ## Changing what it watches
 
 Everything lives in [`watch.config.json`](watch.config.json):

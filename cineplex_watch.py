@@ -409,6 +409,7 @@ def find_matches(payload: dict, theatre_id: str, theatre_name: str, cfg: dict) -
                 "auditorium": field(session, "auditorium"),
                 "seatsRemaining": session.get("seatsRemaining"),
                 "isSoldOut": bool(session.get("isSoldOut")),
+                "session": session,
                 "url": field(
                     session,
                     "deeplinkUrl",
@@ -419,6 +420,182 @@ def find_matches(payload: dict, theatre_id: str, theatre_name: str, cfg: dict) -
             }
         )
     return hits
+
+
+# --------------------------------------------------------------------------
+# Seats
+# --------------------------------------------------------------------------
+
+TICKETING_API = "https://apis.cineplex.com/prod/ticketing/api/v1"
+SHOWTIME_ID_RE = re.compile(r"(?:showtimeId|VistaSessionId)=(\d+)", re.I)
+TAKEN_RE = re.compile(r"sold|taken|occupied|unavailable|reserved|broken|blocked|house", re.I)
+
+
+def session_showtime_id(session: dict) -> str:
+    """The Vista showtime id, which the ticketing API is keyed on.
+
+    Falls back to the id embedded in the seat-map and ticketing URLs, because
+    the field name carrying it is not guaranteed across responses.
+    """
+    for name in ("vistaSessionId", "showtimeId", "sessionId", "id"):
+        value = session.get(name)
+        if value not in (None, ""):
+            return str(value)
+    for name in ("seatMapUrl", "ticketingUrl", "ticketingRedesignUrl", "getTicketingUrlApi"):
+        url = session.get(name)
+        if isinstance(url, str):
+            found = SHOWTIME_ID_RE.search(url)
+            if found:
+                return found.group(1)
+    return ""
+
+
+def looks_like_row(node) -> bool:
+    return isinstance(node, dict) and isinstance(node.get("seats"), list) and bool(node.get("seats"))
+
+
+def seat_is_taken(status) -> bool:
+    """Treat anything that reads as occupied as taken; unknown means free.
+
+    At the moment a date opens every seat is free, so the cost of the two
+    mistakes is lopsided: hiding a good seat is worse than briefly offering
+    one that has just gone.
+    """
+    if status is None:
+        return False
+    if isinstance(status, bool):
+        return status
+    return bool(TAKEN_RE.search(str(status)))
+
+
+def availability_map(avail) -> dict:
+    """seat id -> raw status, wherever the response happens to keep it."""
+    if isinstance(avail, dict):
+        for key in ("seatAvailabilities", "seatAvailability", "seats", "availability"):
+            value = avail.get(key)
+            if isinstance(value, dict):
+                return value
+            if isinstance(value, list):
+                out = {}
+                for entry in value:
+                    if isinstance(entry, dict):
+                        sid = entry.get("id") or entry.get("seatId")
+                        if sid is not None:
+                            out[str(sid)] = entry.get("status", entry.get("state"))
+                return out
+        if avail and all(not isinstance(v, (dict, list)) for v in avail.values()):
+            return avail
+    return {}
+
+
+def seat_column(seat) -> int | None:
+    for name in ("column", "columnIndex", "number", "seatNumber", "x"):
+        value = seat.get(name)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+            return int(value.strip())
+    return None
+
+
+def contiguous_blocks(seats: list[dict], size: int) -> list[list[dict]]:
+    """Every run of `size` seats sitting side by side with no gap.
+
+    A gap in the column numbering is an aisle, which is exactly where a block
+    must not straddle, so consecutive columns are the requirement rather than
+    merely adjacent list positions.
+    """
+    ordered = sorted(
+        (s for s in seats if seat_column(s) is not None), key=lambda s: seat_column(s)
+    )
+    blocks = []
+    for start in range(len(ordered) - size + 1):
+        window = ordered[start : start + size]
+        columns = [seat_column(s) for s in window]
+        if columns[-1] - columns[0] == size - 1:
+            blocks.append(window)
+    return blocks
+
+
+def rank_seat_blocks(layout, avail, cfg: dict) -> list[dict]:
+    """Rank every bookable block of `partySize` adjacent seats, best first.
+
+    Scores on two axes drawn from how IMAX 1.43 is meant to be watched: a row
+    around two thirds back, so the very tall frame sits inside your field of
+    view without neck strain, and dead centre horizontally.
+    """
+    spec = cfg.get("seats") or {}
+    size = int(spec.get("partySize", 2))
+    target_frac = float(spec.get("targetRowFraction", 0.65))
+    row_weight = float(spec.get("rowWeight", 1.0))
+    center_weight = float(spec.get("centerWeight", 0.8))
+    avoid = [a.lower() for a in (spec.get("avoidSeatTypes") or [])]
+
+    rows = find_record_list(layout, looks_like_row) or []
+    if not rows:
+        return []
+    statuses = availability_map(avail)
+
+    ranked = []
+    for index, row in enumerate(rows):
+        all_seats = row.get("seats") or []
+        columns = [c for c in (seat_column(s) for s in all_seats) if c is not None]
+        if not columns:
+            continue
+        row_min, row_max = min(columns), max(columns)
+        row_mid = (row_min + row_max) / 2
+        half_width = max(1.0, (row_max - row_min) / 2)
+
+        free = []
+        for seat in all_seats:
+            sid = str(seat.get("id", seat.get("seatId", "")))
+            if seat_is_taken(statuses.get(sid)):
+                continue
+            if avoid and any(a in str(seat.get("type", "")).lower() for a in avoid):
+                continue
+            free.append(seat)
+
+        row_frac = (index + 0.5) / len(rows)
+        for block in contiguous_blocks(free, size):
+            block_cols = [seat_column(s) for s in block]
+            block_mid = (block_cols[0] + block_cols[-1]) / 2
+            row_penalty = abs(row_frac - target_frac)
+            center_penalty = abs(block_mid - row_mid) / half_width
+            ranked.append(
+                {
+                    "row": field(row, "label", "rowLabel", "name") or str(index + 1),
+                    "rowFraction": round(row_frac, 3),
+                    "seats": [field(s, "label", "seatLabel", "name") or str(seat_column(s)) for s in block],
+                    "score": round(row_weight * row_penalty + center_weight * center_penalty, 4),
+                }
+            )
+    ranked.sort(key=lambda b: b["score"])
+    return ranked
+
+
+def describe_seats(block: dict) -> str:
+    labels = block["seats"]
+    span = f"{labels[0]}-{labels[-1]}" if len(labels) > 1 else labels[0]
+    back = int(round(block["rowFraction"] * 100))
+    return f"row {block['row']} seats {span} ({back}% back)"
+
+
+def best_seats_for(theatre_id: str, session: dict, cfg: dict) -> list[dict]:
+    """Best blocks for one showtime, or [] if the seat map cannot be read.
+
+    Never raises: a seat lookup that fails must not cost the alert itself.
+    """
+    showtime_id = session_showtime_id(session)
+    if not showtime_id:
+        return []
+    base = f"{TICKETING_API}/theatre/{theatre_id}/showtime/{showtime_id}"
+    try:
+        layout = http_get_json(f"{base}/seat-layout")
+        avail = http_get_json(f"{base}/seat-availability")
+    except Exception as exc:
+        log(f"    seat map unavailable for showtime {showtime_id}: {exc}")
+        return []
+    return rank_seat_blocks(layout, avail, cfg)[: int((cfg.get("seats") or {}).get("topN", 3))]
 
 
 # --------------------------------------------------------------------------
@@ -446,7 +623,15 @@ def describe(hit: dict) -> str:
 def build_message(hits: list[dict], cfg: dict) -> tuple[str, str, str]:
     label = cfg.get("label") or "Showtimes"
     title = f"{label} — {len(hits)} new showtime{'s' if len(hits) != 1 else ''}"
-    lines = [describe(h) for h in hits]
+    size = (cfg.get("seats") or {}).get("partySize")
+    lines = []
+    for hit in hits:
+        lines.append(describe(hit))
+        blocks = hit.get("bestSeats") or []
+        if blocks:
+            lines.append(f"   best {size}: " + "; ".join(describe_seats(b) for b in blocks[:2]))
+        elif size:
+            lines.append(f"   (seat map not readable — pick {size} together, centre, ~2/3 back)")
     link = next((h["url"] for h in hits if h.get("url")), cfg.get("fallbackUrl", HOMEPAGE))
     return title, "\n".join(lines), link
 
@@ -619,6 +804,12 @@ def run_check(cfg: dict, state_path: Path, dry_run: bool, fixture: Path | None) 
     if not fresh:
         write_summary(f"No new showtimes ({len(hits)} already known).")
         return 0
+
+    if not fixture and (cfg.get("seats") or {}).get("partySize"):
+        size = cfg["seats"]["partySize"]
+        log(f"looking up best {size} adjacent seats for each new showtime...")
+        for hit in fresh:
+            hit["bestSeats"] = best_seats_for(hit["theatreId"], hit.get("session") or {}, cfg)
 
     title, body, link = build_message(fresh, cfg)
     log(f"\n{title}\n{body}\n{link}\n")

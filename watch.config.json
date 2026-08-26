@@ -11,6 +11,15 @@
 
   "requireBookable": true,
 
+  "seats": {
+    "partySize": 5,
+    "targetRowFraction": 0.65,
+    "rowWeight": 1.0,
+    "centerWeight": 0.8,
+    "avoidSeatTypes": ["wheelchair", "companion"],
+    "topN": 3
+  },
+
   "theatres": [
     { "nameContains": ["mississauga"], "label": "Cineplex Cinemas Mississauga Square One" },
     { "nameContains": ["vaughan"], "label": "Cineplex Cinemas Vaughan" }
