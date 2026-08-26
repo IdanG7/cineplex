@@ -1,0 +1,20 @@
+{
+  "label": "The Odyssey · IMAX 70mm · Sept 17",
+  "language": "en",
+
+  "targetDates": ["2026-09-17"],
+
+  "movieMatch": ["odyssey"],
+
+  "formatMatchAll": ["imax"],
+  "formatMatchAny": ["70mm", "70 mm", "70-mm"],
+
+  "requireBookable": true,
+
+  "theatres": [
+    { "nameContains": ["mississauga"], "label": "Cineplex Cinemas Mississauga Square One" },
+    { "nameContains": ["vaughan"], "label": "Cineplex Cinemas Vaughan" }
+  ],
+
+  "fallbackUrl": "https://www.cineplex.com/movie/imax70-the-odyssey-the-imax-experience-in-7"
+}
