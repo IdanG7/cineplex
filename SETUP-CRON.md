@@ -4,6 +4,36 @@ GitHub's own `schedule` trigger is best-effort, and on this repo it has been
 poor: one automatic run in the first 75 minutes against a `*/5` schedule. That
 is fine for a nightly report and not fine for catching a ticket drop.
 
+## Why GitHub's scheduler behaves this way
+
+Worth knowing, because it decides how much to trust it.
+
+- **Five minutes is the floor.** `*/5` is the shortest interval GitHub accepts;
+  anything more frequent is silently rejected rather than rounded.
+- **`schedule` is best-effort, and runs are dropped, not just delayed.** The
+  trigger sits in a queue GitHub drains on a best-effort basis. Under load it
+  slips — and when the queue is saturated it can skip a firing outright,
+  leaving no trace of the missed run. That is exactly what we observed: no
+  failed runs, no cancelled runs, simply nothing where a run should have been.
+- **The delay is upstream of your runner.** It is in GitHub's event dispatch,
+  before a job is ever queued, so nothing about the workflow itself can fix it.
+- **`:00` is the worst minute on the platform.** GitHub's own documentation
+  says to avoid the start of an hour. Community reports put normal delays at
+  5–30 minutes there, and over 60 minutes during peak windows. Reports
+  disagree on whether `:30` is bad or fine; `:15`, `:30` and `:45` are all
+  busier than an arbitrary minute, so the safe move is to avoid all four
+  quarter-hours. Minutes like 17, 23 and 41 are reported as quiet, because
+  almost nobody picks them.
+- **Manual and API triggers are not affected.** `workflow_dispatch` and
+  `repository_dispatch` are picked up near-instantly. It is specifically the
+  `schedule` event that gets deprioritised — which is the whole reason the
+  setup below works.
+
+This repo's schedule is now `7,22,37,52 * * * *`: every 15 minutes, sitting as
+far from `:00`, `:15`, `:30` and `:45` as it is possible to sit. That makes it a
+usable backstop. It does not make it something to depend on for a ticket drop,
+which is what the external cron below is for.
+
 The workflow already accepts `repository_dispatch`, so any external cron can
 drive it on a schedule that actually holds. Setup is about five minutes.
 
