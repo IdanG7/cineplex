@@ -81,6 +81,27 @@ From the **Actions** tab, `Run workflow` gives you four modes:
   it is quietly matching nothing.
 - **`dry-run`** — a real check that reports but neither alerts nor records.
 - **`test-notify`** — sends a test alert to confirm delivery.
+- **`rehearse`** — a full dress rehearsal on real data. See below.
+
+## Dress rehearsal
+
+`rehearse` answers "what will actually happen when 17 Sept opens?" without
+waiting for it. The Odyssey is playing in IMAX 70mm right now, so the mode
+points the watcher at *today* and lets every real path run: it matches live
+sessions, pulls the real seat map, ranks the best 5 adjacent seats, and pushes
+a genuine notification to your phone. Nothing is simulated.
+
+Two safeguards make it safe to run any time:
+
+- The dedup ledger is a throwaway in a temp directory, so a drill can never
+  mark a genuine 17 Sept showtime as already-reported and swallow the alert
+  you are waiting for.
+- The title is prefixed **DRILL (not real)**, so it cannot be mistaken for the
+  real thing.
+
+The filter, the theatres and the seat preferences are untouched — a drill that
+quietly widened the filter would prove nothing.
+
 
 ## Which seats it picks
 

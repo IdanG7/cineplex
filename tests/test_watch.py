@@ -629,5 +629,46 @@ class TestRealSessionShape(unittest.TestCase):
         self.assertEqual(key, "7408:2026-09-17:2026-08-26T11:00:00")
 
 
+class TestRehearsalIsSafe(unittest.TestCase):
+    """A drill must never eat the real alert."""
+
+    def test_it_writes_to_a_throwaway_ledger_not_the_real_one(self):
+        _cfg, state = w.rehearsal_setup(CONFIG, None)
+        self.assertNotEqual(state.resolve(), w.DEFAULT_STATE.resolve())
+        self.assertIn("rehearsal-", str(state))
+
+    def test_two_drills_do_not_share_a_ledger(self):
+        _c1, first = w.rehearsal_setup(CONFIG, None)
+        _c2, second = w.rehearsal_setup(CONFIG, None)
+        self.assertNotEqual(first, second)
+
+    def test_the_title_says_it_is_a_drill(self):
+        cfg, _state = w.rehearsal_setup(CONFIG, None)
+        self.assertTrue(cfg["label"].startswith("DRILL"))
+        title, _b, _l = w.build_message(run(cfg), cfg)
+        self.assertIn("DRILL", title)
+
+    def test_it_targets_today_by_default(self):
+        cfg, _state = w.rehearsal_setup(CONFIG, None)
+        today = w.datetime.now(w.timezone.utc).date().isoformat()
+        self.assertEqual(cfg["targetDates"], [today])
+
+    def test_an_explicit_date_wins(self):
+        cfg, _state = w.rehearsal_setup(CONFIG, ["2026-09-17"])
+        self.assertEqual(cfg["targetDates"], ["2026-09-17"])
+
+    def test_the_real_config_is_not_mutated(self):
+        before = json.dumps(CONFIG, sort_keys=True)
+        w.rehearsal_setup(CONFIG, ["2026-01-01"])
+        self.assertEqual(json.dumps(CONFIG, sort_keys=True), before)
+
+    def test_the_format_filter_is_unchanged_by_a_drill(self):
+        # A drill that quietly widened the filter would prove nothing.
+        cfg, _state = w.rehearsal_setup(CONFIG, None)
+        self.assertEqual(cfg["formatMatchAll"], CONFIG["formatMatchAll"])
+        self.assertEqual(cfg["formatMatchAny"], CONFIG["formatMatchAny"])
+        self.assertEqual(cfg["seats"], CONFIG["seats"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

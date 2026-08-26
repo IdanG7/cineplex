@@ -16,7 +16,7 @@ on:
         description: "What to run"
         type: choice
         default: check
-        options: [check, probe, test-notify, dry-run]
+        options: [check, probe, test-notify, dry-run, rehearse]
 
 concurrency:
   group: cineplex-watch
@@ -53,6 +53,7 @@ jobs:
             probe)       python cineplex_watch.py --probe ;;
             test-notify) python cineplex_watch.py --test-notify ;;
             dry-run)     python cineplex_watch.py --dry-run ;;
+            rehearse)    python cineplex_watch.py --rehearse ;;
             *)           python cineplex_watch.py ;;
           esac
 

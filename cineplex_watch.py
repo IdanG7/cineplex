@@ -22,6 +22,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -832,6 +833,25 @@ def run_check(cfg: dict, state_path: Path, dry_run: bool, fixture: Path | None) 
     return 0
 
 
+def rehearsal_setup(cfg: dict, dates: list[str] | None) -> tuple[dict, Path]:
+    """Aim a real run at today, so a drill exercises every real path.
+
+    The Odyssey is playing in IMAX 70mm right now, so pointing the watcher at
+    today drives matching, the live seat map and the notification for real
+    rather than simulating any of them.
+
+    Two safeguards, both of which the tests pin. The ledger is a throwaway in
+    a temp directory, so a drill can never mark a genuine 17 Sept showtime as
+    already-reported and swallow the alert that matters. And the title says
+    DRILL, so the push cannot be mistaken for the real thing.
+    """
+    today = datetime.now(timezone.utc).date().isoformat()
+    out = dict(cfg)
+    out["targetDates"] = dates or [today]
+    out["label"] = "DRILL (not real) — " + (cfg.get("label") or "Showtimes")
+    return out, Path(tempfile.mkdtemp(prefix="rehearsal-")) / "seen.json"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
@@ -840,6 +860,11 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="report but do not notify or save state")
     parser.add_argument("--fixture", type=Path, help="parse a local JSON file instead of calling the API")
     parser.add_argument("--test-notify", action="store_true", help="send a test alert and exit")
+    parser.add_argument(
+        "--rehearse",
+        action="store_true",
+        help="dress rehearsal: run the real thing against today's showtimes",
+    )
     parser.add_argument("--probe", action="store_true", help="show what the API actually returns")
     parser.add_argument("--dump", type=Path, help="with --probe, save the raw API responses here")
     args = parser.parse_args()
@@ -855,6 +880,11 @@ def main() -> int:
     cfg = json.loads(args.config.read_text(encoding="utf-8"))
     if args.date:
         cfg["targetDates"] = args.date
+
+    if args.rehearse:
+        cfg, args.state = rehearsal_setup(cfg, args.date)
+        log(f"REHEARSAL: treating {cfg['targetDates']} as the target date(s).")
+        log("REHEARSAL: notifications ARE sent; the dedup ledger is throwaway.")
 
     if args.probe:
         return probe(cfg, args.dump)
