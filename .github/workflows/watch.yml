@@ -38,13 +38,17 @@ permissions:
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # The external cron polls every minute, and the concurrency group keeps at
+    # most one run pending: a job that hangs therefore blocks every poll behind
+    # it until it times out. Three minutes caps that damage at three missed
+    # polls. The watcher itself takes about two seconds.
+    timeout-minutes: 3
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+      # No setup-python step: ubuntu-latest ships 3.12 already and the watcher
+      # has no dependencies. Provisioning a second copy cost 10-20s of a
+      # 60-second budget to change nothing.
 
       - name: Run watcher
         env:
@@ -60,11 +64,11 @@ jobs:
           MODE: ${{ inputs.mode || 'check' }}
         run: |
           case "$MODE" in
-            probe)       python cineplex_watch.py --probe ;;
-            test-notify) python cineplex_watch.py --test-notify ;;
-            dry-run)     python cineplex_watch.py --dry-run ;;
-            rehearse)    python cineplex_watch.py --rehearse ;;
-            *)           python cineplex_watch.py ;;
+            probe)       python3 cineplex_watch.py --probe ;;
+            test-notify) python3 cineplex_watch.py --test-notify ;;
+            dry-run)     python3 cineplex_watch.py --dry-run ;;
+            rehearse)    python3 cineplex_watch.py --rehearse ;;
+            *)           python3 cineplex_watch.py ;;
           esac
 
       - name: Record which showtimes were already reported

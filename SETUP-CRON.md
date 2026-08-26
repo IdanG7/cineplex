@@ -91,7 +91,7 @@ card.
 | --- | --- |
 | Title | `Cineplex Odyssey watcher` |
 | URL | `https://api.github.com/repos/IdanG7/cineplex/dispatches` |
-| Schedule | Every 5 minutes |
+| Schedule | Every 1 minute |
 | Request method | **POST** |
 
 Then open **Advanced / Headers** and add:
@@ -128,7 +128,62 @@ matter how many triggers fire.
 ## Cost
 
 The repository is public, so Actions minutes are free and unlimited. At every
-five minutes that is ~288 runs a day, each about 15 seconds.
+minute that is ~1,440 runs a day, each about ten seconds — roughly two seconds
+of watcher plus checkout and the state commit.
+
+## What a one-minute cadence changes
+
+Polling every minute is what actually decides whether you get the seats: the
+watcher itself runs in about two seconds, so essentially all of the delay
+between tickets opening and your phone buzzing is the gap between polls. Going
+from five minutes to one cuts the average delay from ~150 seconds to ~30.
+
+Three things in this repo are set up for that rate specifically:
+
+- **`timeout-minutes: 3` on the job.** The `concurrency` group keeps at most
+  one run pending, so a hung run blocks every poll queued behind it. A short
+  timeout caps that at three missed polls instead of ten.
+- **No `setup-python` step.** `ubuntu-latest` already ships 3.12 and the
+  watcher has no dependencies; provisioning a second copy spent 10–20 seconds
+  of a 60-second budget to change nothing.
+- **`escalate.maxMinutes`, not a repeat count.** The buy-now alert repeats for
+  a number of *minutes*, because the polling rate lives at cron-job.org where
+  nothing in this repo can see it change. A count of repeats would silently
+  mean two hours at one cadence and twenty-four minutes at another.
+
+## Two settings that pay for themselves
+
+Both are optional and both make each run faster and less breakable.
+
+**Pin the theatre ids.** `watch.config.json` now carries `"id": "7420"` and
+`"id": "7408"`, which skips fetching and name-matching the 152-theatre
+catalogue on every poll. Name matching still runs if you remove the ids.
+
+**Optionally set `CINEPLEX_API_KEY` as a repository secret.** This is
+insurance, not speed — do not set it expecting the watcher to get faster.
+
+Every run scrapes the key out of Cineplex's JS bundles, which costs about a
+second and is self-correcting: rotate the key on their side and the next run
+simply picks up the new one. What scraping cannot survive is Cineplex
+restructuring those bundles, which would take the watcher dark with no warning.
+`CINEPLEX_API_KEY` is the floor under that case — it is consulted *only* when
+scraping fails, so a stale value costs nothing and a working one keeps the
+watch alive while you fix the scraper.
+
+Print your own copy locally:
+
+```bash
+python3 -c "import cineplex_watch; print(cineplex_watch.discover_subscription_key())"
+```
+
+Put that value in **Settings → Secrets and variables → Actions → Secrets** as
+`CINEPLEX_API_KEY`. Use a **secret**, not a variable — variables are not masked
+in workflow logs and this repository is public.
+
+A rotation is handled twice over: scraping picks up the new key on the next
+run, and a rejected key is re-derived mid-run on any 401 or 403. The secret is
+never the thing in charge, so it cannot go stale in a way that costs you a
+showtime.
 
 ## Turning it off
 

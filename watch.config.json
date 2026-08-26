@@ -11,6 +11,12 @@
 
   "requireBookable": true,
 
+  "escalate": {
+    "rows": ["F", "G"],
+    "seats": [11, 19],
+    "maxMinutes": 120
+  },
+
   "seats": {
     "partySize": 6,
     "targetRowFraction": 0.65,
@@ -21,8 +27,8 @@
   },
 
   "theatres": [
-    { "nameContains": ["mississauga"], "label": "Cineplex Cinemas Mississauga Square One" },
-    { "nameContains": ["vaughan"], "label": "Cineplex Cinemas Vaughan" }
+    { "id": "7420", "nameContains": ["mississauga"], "label": "Cineplex Cinemas Mississauga Square One" },
+    { "id": "7408", "nameContains": ["vaughan"], "label": "Cineplex Cinemas Vaughan" }
   ],
 
   "fallbackUrl": "https://www.cineplex.com/movie/imax70-the-odyssey-the-imax-experience-in-7"

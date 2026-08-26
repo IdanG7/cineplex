@@ -168,11 +168,28 @@ def discover_subscription_key(max_chunks: int = 60) -> str:
 
 
 def get_subscription_key() -> str:
-    override = (os.environ.get("CINEPLEX_API_KEY") or "").strip()
-    if override:
-        log("  using CINEPLEX_API_KEY from the environment")
-        return override
-    return discover_subscription_key()
+    """Scrape the key; fall back to a pinned one only if scraping fails.
+
+    This order matters, and the obvious one is wrong. A pinned key is the part
+    that goes stale -- Cineplex rotates it and a hardcoded copy is silently a
+    run behind forever -- while scraping is self-correcting by construction and
+    costs about a second against a sixty-second polling budget.
+
+    What scraping cannot survive is Cineplex restructuring their bundles, which
+    would take the watcher dark with no warning. That is the failure
+    CINEPLEX_API_KEY exists for: a floor under the scraper, not a substitute
+    for it. A stale fallback still costs nothing, because a rejected key is
+    re-derived mid-run anyway.
+    """
+    try:
+        return discover_subscription_key()
+    except Exception as exc:
+        fallback = (os.environ.get("CINEPLEX_API_KEY") or "").strip()
+        if not fallback:
+            raise
+        log(f"  !! key discovery failed ({exc})")
+        log("  !! falling back to CINEPLEX_API_KEY -- check whether the scraper needs fixing")
+        return fallback
 
 
 # --------------------------------------------------------------------------
@@ -252,14 +269,47 @@ def find_record_list(node, predicate, depth: int = 0) -> list | None:
     return None
 
 
+def find_all_record_lists(node, predicate, depth: int = 0) -> list[list]:
+    """Every list whose entries satisfy `predicate`, not merely the first."""
+    if depth > 6:
+        return []
+    if isinstance(node, list):
+        if node and all(predicate(item) for item in node[:3]):
+            return [node]
+        out = []
+        for item in node:
+            out.extend(find_all_record_lists(item, predicate, depth + 1))
+        return out
+    if isinstance(node, dict):
+        out = []
+        for value in node.values():
+            out.extend(find_all_record_lists(value, predicate, depth + 1))
+        return out
+    return []
+
+
 def list_theatres(api: Api, language: str = "en") -> list[dict]:
+    """The whole catalogue, not the first slice of it the response happens to hold.
+
+    The response splits into `favouriteTheatres`, `nearbyTheatres` and
+    `otherTheatres`, and "nearby" is computed from the caller's IP -- so taking
+    the first list found returns four theatres out of a hundred and fifty-odd,
+    varies with where the run happens to execute, and drops a configured
+    theatre without ever saying it did.
+    """
     payload = api.get("theatres", {"language": language})
-    found = find_record_list(payload, looks_like_theatre)
-    if found is None:
+    seen: set[str] = set()
+    theatres: list[dict] = []
+    for records in find_all_record_lists(payload, looks_like_theatre):
+        for record in records:
+            key = next((str(record[f]) for f in ID_FIELDS if record.get(f) is not None), "")
+            if key and key not in seen:
+                seen.add(key)
+                theatres.append(record)
+    if not theatres:
         log(f"  !! no theatre records found in the response; shape was {describe_shape(payload)}")
         log("  !! raw response (truncated): " + json.dumps(payload)[:1500])
-        return []
-    return found
+    return theatres
 
 
 def get_showtimes(api: Api, location_id: str, date_iso: str, language: str = "en") -> dict:
@@ -506,6 +556,107 @@ def seat_column(seat) -> int | None:
     return None
 
 
+def seat_areas(layout) -> list[tuple[str, dict, list[dict]]]:
+    """Every seating area in the layout, as (name, area, rows).
+
+    A Cineplex house is not one grid. The response splits it into areas --
+    `standardSeats`, `dboxSeats`, `balconySeats` -- each with its own rows and
+    its own origin. Reading only the first one found is how the ten D-BOX seats
+    in the dead centre of row H become invisible while the four stub seats out
+    by the wall, which share that row label, are all the ranker can see.
+    """
+    found: list[tuple[str, dict, list[dict]]] = []
+
+    def walk(name: str, node, depth: int = 0) -> None:
+        if depth > 6:
+            return
+        if isinstance(node, dict):
+            rows = node.get("rows")
+            if isinstance(rows, list) and any(looks_like_row(r) for r in rows):
+                found.append((name, node, [r for r in rows if looks_like_row(r)]))
+                return
+            for key, value in node.items():
+                walk(key, value, depth + 1)
+        elif isinstance(node, list):
+            if node and any(looks_like_row(r) for r in node):
+                found.append((name, {}, [r for r in node if looks_like_row(r)]))
+                return
+            for item in node:
+                walk(name, item, depth + 1)
+
+    walk("seats", layout)
+    return found
+
+
+def number_of(node, name: str, fallback: float) -> float:
+    value = node.get(name)
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else fallback
+
+
+def row_depth(area: dict, row: dict, index: int) -> float:
+    """How far back a row sits, in rows, on the house's own scale.
+
+    `number` is the row's index within its area and `top` is where that area
+    starts, so the two together survive the areas being merged -- which plain
+    list position does not, D-BOX row H being number 0 of its own area while
+    sitting fourteen rows back in the house.
+    """
+    return number_of(area, "top", 0.0) + number_of(row, "number", float(index))
+
+
+def seat_x(area: dict, seat: dict) -> float | None:
+    """Where a seat sits across the house, in standard-seat widths.
+
+    Areas do not share an origin or a seat width -- the D-BOX area starts eight
+    columns in and its seats are 1.4x as wide -- so a raw column index is only
+    comparable to another column index from the same area.
+    """
+    column = seat_column(seat)
+    if column is None:
+        return None
+    return number_of(area, "left", 0.0) + (column + 0.5) * number_of(area, "columnWidth", 1.0)
+
+
+def house_frame(layout, areas: list[tuple[str, dict, list[dict]]]) -> tuple[float, float, float]:
+    """(rows deep, centre line, half width) for the whole auditorium.
+
+    The centre line has to come from the house, not from the row: rows are
+    ragged -- row A of the Square One IMAX runs columns 3-22 against a house of
+    0-28 -- so a block centred in its own row sits a seat and a half left of
+    the screen.
+    Normalising by the house also makes one row's centre penalty mean the same
+    as another's, which is the whole basis for ranking them against each other.
+    """
+    depths = [row_depth(area, row, i) for _n, area, rows in areas for i, row in enumerate(rows)]
+    total_rows = number_of(layout, "totalRows", 0.0) if isinstance(layout, dict) else 0.0
+    if total_rows <= 0:
+        total_rows = (max(depths) + 1) if depths else 1.0
+
+    total_columns = number_of(layout, "totalColumns", 0.0) if isinstance(layout, dict) else 0.0
+    if total_columns > 0:
+        return total_rows, total_columns / 2, max(1.0, total_columns / 2)
+
+    xs = [x for _n, area, rows in areas for row in rows for s in row["seats"]
+          if (x := seat_x(area, s)) is not None]
+    if not xs:
+        return total_rows, 0.0, 1.0
+    return total_rows, (min(xs) + max(xs)) / 2, max(1.0, (max(xs) - min(xs)) / 2)
+
+
+def bookable_seats(area: dict, row: dict, statuses: dict, avoid: list[str]) -> list[dict]:
+    free = []
+    for seat in row.get("seats") or []:
+        sid = str(seat.get("id", seat.get("seatId", "")))
+        if seat_is_taken(statuses.get(sid)):
+            continue
+        if avoid and any(a in str(seat.get("type", "")).lower() for a in avoid):
+            continue
+        if seat_x(area, seat) is None:
+            continue
+        free.append(seat)
+    return free
+
+
 def contiguous_blocks(seats: list[dict], size: int) -> list[list[dict]]:
     """Every run of `size` seats sitting side by side with no gap.
 
@@ -525,6 +676,20 @@ def contiguous_blocks(seats: list[dict], size: int) -> list[list[dict]]:
     return blocks
 
 
+def seat_labels(block: list[dict]) -> list[str]:
+    """Seat labels in seating order.
+
+    The block is ordered by column, which for most rows runs the same way as
+    the numbering -- but not all of them, and a block printed as H12-H7 reads
+    like a mistake.
+    """
+    labels = [field(s, "label", "seatLabel", "name") or str(seat_column(s)) for s in block]
+    numbers = [int(m.group(1)) for s in labels if (m := re.search(r"(\d+)$", s))]
+    if len(numbers) == len(labels) and numbers == sorted(numbers, reverse=True):
+        labels.reverse()
+    return labels
+
+
 def rank_seat_blocks(layout, avail, cfg: dict) -> list[dict]:
     """Rank every bookable block of `partySize` adjacent seats, best first.
 
@@ -539,45 +704,31 @@ def rank_seat_blocks(layout, avail, cfg: dict) -> list[dict]:
     center_weight = float(spec.get("centerWeight", 0.8))
     avoid = [a.lower() for a in (spec.get("avoidSeatTypes") or [])]
 
-    rows = find_record_list(layout, looks_like_row) or []
-    if not rows:
+    areas = seat_areas(layout)
+    if not areas:
         return []
     statuses = availability_map(avail)
+    total_rows, centre, half_width = house_frame(layout, areas)
 
     ranked = []
-    for index, row in enumerate(rows):
-        all_seats = row.get("seats") or []
-        columns = [c for c in (seat_column(s) for s in all_seats) if c is not None]
-        if not columns:
-            continue
-        row_min, row_max = min(columns), max(columns)
-        row_mid = (row_min + row_max) / 2
-        half_width = max(1.0, (row_max - row_min) / 2)
-
-        free = []
-        for seat in all_seats:
-            sid = str(seat.get("id", seat.get("seatId", "")))
-            if seat_is_taken(statuses.get(sid)):
-                continue
-            if avoid and any(a in str(seat.get("type", "")).lower() for a in avoid):
-                continue
-            free.append(seat)
-
-        row_frac = (index + 0.5) / len(rows)
-        for block in contiguous_blocks(free, size):
-            block_cols = [seat_column(s) for s in block]
-            block_mid = (block_cols[0] + block_cols[-1]) / 2
+    for name, area, rows in areas:
+        for index, row in enumerate(rows):
+            free = bookable_seats(area, row, statuses, avoid)
+            row_frac = (row_depth(area, row, index) + 0.5) / total_rows
             row_penalty = abs(row_frac - target_frac)
-            center_penalty = abs(block_mid - row_mid) / half_width
-            ranked.append(
-                {
-                    "row": field(row, "label", "rowLabel", "name") or str(index + 1),
-                    "rowFraction": round(row_frac, 3),
-                    "centreOffset": round(center_penalty, 3),
-                    "seats": [field(s, "label", "seatLabel", "name") or str(seat_column(s)) for s in block],
-                    "score": round(row_weight * row_penalty + center_weight * center_penalty, 4),
-                }
-            )
+            for block in contiguous_blocks(free, size):
+                xs = [seat_x(area, s) for s in block]
+                centre_penalty = abs((xs[0] + xs[-1]) / 2 - centre) / half_width
+                ranked.append(
+                    {
+                        "row": field(row, "label", "rowLabel", "name") or str(index + 1),
+                        "area": name,
+                        "rowFraction": round(row_frac, 3),
+                        "centreOffset": round(centre_penalty, 3),
+                        "seats": seat_labels(block),
+                        "score": round(row_weight * row_penalty + center_weight * centre_penalty, 4),
+                    }
+                )
     ranked.sort(key=lambda b: b["score"])
     return ranked
 
@@ -593,23 +744,51 @@ def largest_run(layout, avail, cfg: dict) -> int:
     avoid = [a.lower() for a in (spec.get("avoidSeatTypes") or [])]
     statuses = availability_map(avail)
     best = 0
-    for row in find_record_list(layout, looks_like_row) or []:
-        free = []
-        for seat in row.get("seats") or []:
-            sid = str(seat.get("id", seat.get("seatId", "")))
-            if seat_is_taken(statuses.get(sid)):
-                continue
-            if avoid and any(a in str(seat.get("type", "")).lower() for a in avoid):
-                continue
-            free.append(seat)
-        columns = sorted(c for c in (seat_column(s) for s in free) if c is not None)
-        run = 0
-        previous = None
-        for column in columns:
-            run = run + 1 if previous is not None and column == previous + 1 else 1
-            previous = column
-            best = max(best, run)
+    for _name, area, rows in seat_areas(layout):
+        for row in rows:
+            free = bookable_seats(area, row, statuses, avoid)
+            columns = sorted(c for c in (seat_column(s) for s in free) if c is not None)
+            run = 0
+            previous = None
+            for column in columns:
+                run = run + 1 if previous is not None and column == previous + 1 else 1
+                previous = column
+                best = max(best, run)
     return best
+
+
+def seat_numbers(block: dict) -> list[int]:
+    """The trailing number of each seat label: ["G12", "G13"] -> [12, 13]."""
+    out = []
+    for label in block.get("seats") or []:
+        found = re.search(r"(\d+)$", str(label))
+        if found:
+            out.append(int(found.group(1)))
+    return out
+
+
+def block_is_target(block: dict, spec: dict) -> bool:
+    """Is this the block worth waking someone up for?
+
+    A block has to clear both bars to qualify: the right rows, and far enough
+    from the walls. The seat span is deliberately wider than the party -- with
+    a span of 11-19 a party of six still qualifies at 12-17, 13-18 or 11-16 --
+    because a rule narrow enough to name one exact block goes silent the moment
+    a single seat at its edge is taken, which is the opposite of the point.
+    """
+    if not spec:
+        return False
+    rows = [str(r).upper() for r in (spec.get("rows") or [])]
+    if rows and str(block.get("row", "")).upper() not in rows:
+        return False
+    span = spec.get("seats") or []
+    if len(span) == 2:
+        numbers = seat_numbers(block)
+        if len(numbers) != len(block.get("seats") or []):
+            return False  # unnumbered labels cannot be judged against a span
+        if min(numbers) < int(span[0]) or max(numbers) > int(span[1]):
+            return False
+    return True
 
 
 def describe_seats(block: dict) -> str:
@@ -641,9 +820,16 @@ def best_seats_for(theatre_id: str, session: dict, cfg: dict) -> dict:
         log(f"    seat map unavailable for showtime {showtime_id}: {exc}")
         return blank
     top = int((cfg.get("seats") or {}).get("topN", 3))
+    ranked = rank_seat_blocks(layout, avail, cfg)
+    spec = cfg.get("escalate") or {}
+    # Searched over the whole ranking, not the top few: a block can clear the
+    # escalation bar while sitting fourth on score, and truncating first would
+    # lose exactly the showing worth shouting about.
+    target = next((b for b in ranked if block_is_target(b, spec)), None)
     return {
         "readable": True,
-        "blocks": rank_seat_blocks(layout, avail, cfg)[:top],
+        "blocks": ranked[:top],
+        "target": target,
         "largest": largest_run(layout, avail, cfg),
     }
 
@@ -702,6 +888,20 @@ def pretty_clock(value: str) -> str:
         return value or "?"
 
 
+AREA_TAGS = {"dbox": "D-BOX", "balcony": "balcony", "vip": "VIP", "lounger": "lounger"}
+
+
+def area_tag(block: dict) -> str:
+    """The premium area a block sits in, if it is not the ordinary seats.
+
+    A D-BOX seat carries an upcharge and moves during the film. Recommending
+    six of them as simply the best seats in the house is the same failure as
+    recommending the front row without saying it is the front row.
+    """
+    name = str(block.get("area", "")).lower()
+    return next((tag for key, tag in AREA_TAGS.items() if key in name), "")
+
+
 def seat_quality(block: dict) -> str:
     """A plain verdict on a block, so a bad seat is never sold as a good one.
 
@@ -712,14 +912,17 @@ def seat_quality(block: dict) -> str:
     back = block.get("rowFraction", 0)
     off_centre = block.get("centreOffset", 0) > 0.2
     if back < 0.25:
-        return "front row"
-    if back < 0.40:
-        return "a bit close"
-    if back > 0.85:
-        return "very back"
-    if off_centre:
-        return "good row, off-centre"
-    return "ideal"
+        verdict = "front row"
+    elif back < 0.40:
+        verdict = "a bit close"
+    elif back > 0.85:
+        verdict = "very back"
+    elif off_centre:
+        verdict = "good row, off-centre"
+    else:
+        verdict = "ideal"
+    tag = area_tag(block)
+    return f"{tag} · {verdict}" if tag else verdict
 
 
 def format_block(block: dict) -> str:
@@ -778,15 +981,135 @@ def build_message(hits: list[dict], cfg: dict) -> tuple[str, str, str]:
     return title, "\n".join(lines), link
 
 
+def within_escalation_window(entry: dict | None, minutes: float) -> bool:
+    """Is this escalation still inside its allotted shouting time?
+
+    Measured in wall-clock minutes rather than in polls. A count of repeats
+    means something different at every polling rate -- twenty-four of them is
+    two hours at a five-minute poll and twenty-four minutes at a one-minute
+    poll -- so the cadence could be changed at the cron service, with no sign
+    here, and quietly cut the alert window by a factor of five.
+    """
+    if not entry:
+        return True
+    try:
+        started = datetime.fromisoformat(entry["since"])
+    except (KeyError, TypeError, ValueError):
+        return True
+    return (datetime.now(timezone.utc) - started).total_seconds() < minutes * 60
+
+
+def go_message(hits: list[dict], cfg: dict) -> tuple[str, str, str, list]:
+    """The alert for "the seats you asked for are sitting there right now".
+
+    Deliberately a different shape from the routine alert: a different title,
+    the one showtime to act on first, and a tap that lands on that showtime's
+    seat picker. The routine alert is a digest to read; this one is an
+    instruction to follow while half awake.
+    """
+    size = (cfg.get("seats") or {}).get("partySize") or 0
+    # Best seats first; equal seats settled by the earlier showtime, so the
+    # same drop always names the same showtime rather than whichever theatre
+    # the API happened to answer first.
+    ranked = sorted(hits, key=lambda h: (h["seatReport"]["target"]["score"], h["start"]))
+    first = ranked[0]
+    block = first["seatReport"]["target"]
+
+    title = f"BUY NOW — {format_block(block)} open for {pretty_date(first['date'])}"
+
+    lines = [
+        f"{size} together in {format_block(block)} at "
+        f"{short_theatre(first['theatre'])}, {pretty_clock(first['start'])}.",
+        "",
+    ]
+    grouped: dict[str, list[dict]] = {}
+    for hit in ranked:
+        grouped.setdefault(short_theatre(hit["theatre"]), []).append(hit)
+    for theatre, group in grouped.items():
+        lines.append(theatre.upper())
+        for hit in sorted(group, key=lambda h: h["start"]):
+            mark = " <-- tap Buy now" if hit is first else ""
+            lines.append(
+                f"{pretty_clock(hit['start']):>8}  "
+                f"{format_block(hit['seatReport']['target']):<11}"
+                f"{seat_quality(hit['seatReport']['target'])}{mark}"
+            )
+        lines.append("")
+    lines.append("Nothing is held for you -- you still pick the seats and pay.")
+    lines.append('Tap "Got it" to stop these alerts.')
+
+    actions = [{"action": "view", "label": "Buy now", "url": first["url"], "clear": True}]
+    if ack_topic():
+        actions.append(
+            {
+                "action": "http",
+                "label": "Got it",
+                "url": f"{ntfy_server()}/{ack_topic()}",
+                "method": "POST",
+                "body": "ack",
+                "clear": True,
+            }
+        )
+    return title, "\n".join(lines).rstrip(), first["url"], actions
+
+
 # --------------------------------------------------------------------------
 # Notifiers
 # --------------------------------------------------------------------------
 
-def notify_ntfy(title: str, body: str, link: str) -> bool:
+def ntfy_server() -> str:
+    return (os.environ.get("NTFY_SERVER") or "https://ntfy.sh").rstrip("/")
+
+
+def ntfy_headers() -> dict:
+    headers = {"Content-Type": "application/json"}
+    token = (os.environ.get("NTFY_TOKEN") or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def ack_topic() -> str:
+    """The topic a "stop shouting" tap publishes to.
+
+    A separate topic rather than a flag somewhere: the phone can reach it with
+    one tap and no auth dance, and the watcher -- which is a fresh container on
+    every poll and remembers nothing -- can read it back on the next run.
+    """
+    topic = (os.environ.get("NTFY_TOPIC") or "").strip()
+    return f"{topic}-ack" if topic else ""
+
+
+def acknowledged_since(since_iso: str) -> bool:
+    """Has anything been published to the ack topic since `since_iso`?
+
+    Fails closed on a network error -- an unreachable ntfy must not read as
+    "acknowledged" and silence an alert that was never seen.
+    """
+    topic = ack_topic()
+    if not topic:
+        return False
+    try:
+        since = int(datetime.fromisoformat(since_iso).timestamp())
+        raw = http_get(f"{ntfy_server()}/{topic}/json?poll=1&since={since}", ntfy_headers())
+    except Exception as exc:
+        log(f"  could not read the ack topic ({exc}); treating as not acknowledged")
+        return False
+    for line in raw.decode("utf-8", "replace").splitlines():
+        try:
+            message = json.loads(line)
+        except ValueError:
+            continue
+        if message.get("event") == "message":
+            return True
+    return False
+
+
+def notify_ntfy(title: str, body: str, link: str, actions: list | None = None,
+                tags: list | None = None) -> bool:
     topic = (os.environ.get("NTFY_TOPIC") or "").strip()
     if not topic:
         return False
-    server = (os.environ.get("NTFY_SERVER") or "https://ntfy.sh").rstrip("/")
     # Publish via ntfy's JSON API rather than its header API: urllib encodes
     # headers as latin-1, and the title carries an em dash, which would blow up
     # with UnicodeEncodeError before the request ever left the machine.
@@ -795,15 +1118,13 @@ def notify_ntfy(title: str, body: str, link: str) -> bool:
         "title": title,
         "message": body,
         "priority": 5,
-        "tags": ["clapper", "tickets"],
+        "tags": tags or ["clapper", "tickets"],
     }
     if link:
         payload["click"] = link
-    headers = {"Content-Type": "application/json"}
-    token = (os.environ.get("NTFY_TOKEN") or "").strip()
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    http_post(server + "/", json.dumps(payload).encode("utf-8"), headers)
+    if actions:
+        payload["actions"] = actions
+    http_post(ntfy_server() + "/", json.dumps(payload).encode("utf-8"), ntfy_headers())
     log("  notified: ntfy")
     return True
 
@@ -828,11 +1149,11 @@ def notify_webhook(title: str, body: str, link: str) -> bool:
     return True
 
 
-def notify(title: str, body: str, link: str) -> int:
+def notify(title: str, body: str, link: str, actions: list | None = None) -> int:
     sent = 0
     for fn in (notify_ntfy, notify_webhook):
         try:
-            if fn(title, body, link):
+            if fn(title, body, link, actions) if fn is notify_ntfy else fn(title, body, link):
                 sent += 1
         except Exception as exc:  # one broken channel must not silence the other
             log(f"  !! {fn.__name__} failed: {exc}")
@@ -941,17 +1262,97 @@ def run_check(cfg: dict, state_path: Path, dry_run: bool, fixture: Path | None) 
     fresh = sorted(
         (h for h in hits if h["key"] not in already), key=lambda h: (h["date"], h["start"])
     )
-    log(f"{len(hits)} matching session(s), {len(fresh)} new")
+    escalating = dict(state.get("escalating") or {})
+    # A showtime already announced is still worth re-examining while it is
+    # under escalation: the alert repeats until it is acknowledged, and that
+    # means re-reading the seat map each poll rather than trusting the reading
+    # that started it.
+    watching = fresh + [h for h in hits if h["key"] in escalating and h not in fresh]
+    log(f"{len(hits)} matching session(s), {len(fresh)} new, {len(escalating)} escalating")
 
-    if not fresh:
+    if not watching:
         write_summary(f"No new showtimes ({len(hits)} already known).")
         return 0
 
     if not fixture and (cfg.get("seats") or {}).get("partySize"):
         size = cfg["seats"]["partySize"]
-        log(f"looking up best {size} adjacent seats for each new showtime...")
-        for hit in fresh:
+        log(f"looking up best {size} adjacent seats for each showtime in play...")
+        for hit in watching:
             hit["seatReport"] = best_seats_for(hit["theatreId"], hit.get("session") or {}, cfg)
+
+    return dispatch(watching, fresh, escalating, cfg, state, state_path, already, dry_run)
+
+
+def dispatch(watching: list[dict], fresh: list[dict], escalating: dict, cfg: dict,
+             state: dict, state_path: Path, already: set, dry_run: bool) -> int:
+    """Decide which alert this poll owes the user, and record what it sent."""
+    spec = cfg.get("escalate") or {}
+    window = float(spec.get("maxMinutes", 120))
+    # An acknowledgement is permanent for the showtimes it silenced. Clearing
+    # only the live escalation would let the next poll -- which still sees the
+    # same free seats -- start the whole thing over from zero, which is how a
+    # "stop" button turns into a snooze button.
+    settled = set(state.get("acknowledged") or [])
+    go = [h for h in watching
+          if (h.get("seatReport") or {}).get("target") and h["key"] not in settled]
+
+    # One tap silences every showtime, because only one of them gets bought.
+    if escalating and not dry_run:
+        since = min(entry["since"] for entry in escalating.values())
+        if acknowledged_since(since):
+            log("  acknowledged on the ack topic -- standing down")
+            state["acknowledged"] = sorted(settled | set(escalating))
+            state["escalating"] = {}
+            state["alerted"] = sorted(already | {h["key"] for h in watching})
+            save_state(state_path, state)
+            write_summary("Acknowledged; escalation stopped.")
+            return 0
+
+    # Seats that vanished mid-escalation: say so once rather than going quiet,
+    # because the last thing sent was an instruction to go and buy them.
+    lost = [k for k in escalating if k not in {h["key"] for h in go}]
+    for key in lost:
+        log(f"  target seats gone for {key} -- escalation ends")
+        escalating.pop(key)
+
+    if go and all(within_escalation_window(escalating.get(h["key"]), window) for h in go):
+        title, body, link, actions = go_message(go, cfg)
+        log(f"\n{title}\n{body}\n{link}\n")
+        write_summary(f"## {title}\n\n{body}\n\n{link}")
+        if dry_run:
+            log("dry run -- not sending notifications, not recording state")
+            return 0
+        notify(title, body, link, actions)
+        now = datetime.now(timezone.utc).isoformat()
+        for hit in go:
+            entry = escalating.get(hit["key"]) or {"since": now, "sent": 0}
+            entry["sent"] += 1
+            entry["seats"] = format_block(hit["seatReport"]["target"])
+            escalating[hit["key"]] = entry
+        state["escalating"] = escalating
+        state["alerted"] = sorted(already | {h["key"] for h in watching})
+        save_state(state_path, state)
+        return 0
+
+    if go:
+        log(f"  escalation ran its {window:g}-minute course -- standing down")
+        settled |= {h["key"] for h in go}
+        state["acknowledged"] = sorted(settled)
+        escalating = {}
+
+    if not fresh:
+        state["escalating"] = escalating
+        if lost:
+            title = "Target seats gone"
+            body = "The seats you were told to take are no longer free. " \
+                   "Run a check for what is left."
+            log(f"\n{title}\n{body}\n")
+            if not dry_run:
+                notify(title, body, next((h["url"] for h in watching if h.get("url")), ""))
+        if not dry_run:
+            save_state(state_path, state)
+        write_summary("No new showtimes.")
+        return 0
 
     title, body, link = build_message(fresh, cfg)
     log(f"\n{title}\n{body}\n{link}\n")
@@ -962,6 +1363,7 @@ def run_check(cfg: dict, state_path: Path, dry_run: bool, fixture: Path | None) 
         return 0
 
     notify(title, body, link)
+    state["escalating"] = escalating
     state["alerted"] = sorted(already | {h["key"] for h in fresh})
     save_state(state_path, state)
     return 0
