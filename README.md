@@ -19,6 +19,17 @@ If you change the default branch, make sure the workflow moves with it or the
 schedule stops firing. `workflow_dispatch` has the same rule, so manual runs
 need it there too.
 
+## Scheduling
+
+GitHub's own `schedule` trigger is best-effort and has been unreliable here —
+one automatic run in the first 75 minutes against a `*/5` schedule. Good enough
+for a nightly report, not good enough for catching a ticket drop.
+
+**[SETUP-CRON.md](SETUP-CRON.md) sets up an external cron** that drives the
+workflow through `repository_dispatch` on a schedule that actually holds. About
+five minutes, needs a fine-grained token. Leave the `schedule:` trigger in place
+alongside it — it costs nothing and is a free second chance.
+
 ## Setup (one time, ~2 minutes)
 
 The watcher runs on its own. It just needs somewhere to send the alert.
