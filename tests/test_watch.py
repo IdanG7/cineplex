@@ -255,6 +255,19 @@ class TestShapeTolerance(unittest.TestCase):
     def test_extract_days_on_a_useless_payload_is_empty_not_an_error(self):
         self.assertEqual(w.extract_days({"message": "unauthorized"}), [])
 
+    def test_a_top_level_array_response_is_handled(self):
+        # Confirmed live: theatre 7408 answers /showtimes with
+        # [{"theatre": ..., "theatreId": ..., "dates": [...]}] rather than an object.
+        live = [{"theatre": "Cineplex Cinemas Vaughan", "theatreId": 7408, "dates": FIXTURE["dates"]}]
+        self.assertEqual(len(w.extract_days(live)), 2)
+        keys = {h["key"].split(":")[-1] for h in w.find_matches(live, "7408", "Vaughan", CONFIG)}
+        self.assertEqual(keys, {"HIT-A", "HIT-B", "HIT-C-TITLE-ONLY"})
+
+    def test_a_204_empty_response_is_simply_no_showtimes(self):
+        # Confirmed live: theatre 7420 answers HTTP 204 with no body for a date
+        # that has nothing on it. That is the watcher's resting state.
+        self.assertEqual(w.find_matches({}, "7420", "Mississauga", CONFIG), [])
+
     def test_matching_still_works_through_a_wrapped_payload(self):
         wrapped = {"data": {"showtimes": {"dates": FIXTURE["dates"]}}}
         keys = {h["key"].split(":")[-1] for h in w.find_matches(wrapped, "9999", "T", CONFIG)}

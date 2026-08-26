@@ -409,7 +409,13 @@ def find_matches(payload: dict, theatre_id: str, theatre_name: str, cfg: dict) -
                 "auditorium": field(session, "auditorium"),
                 "seatsRemaining": session.get("seatsRemaining"),
                 "isSoldOut": bool(session.get("isSoldOut")),
-                "url": field(session, "deeplinkUrl", "seatMapUrl"),
+                "url": field(
+                    session,
+                    "deeplinkUrl",
+                    "ticketingRedesignUrl",
+                    "ticketingUrl",
+                    "seatMapUrl",
+                ),
             }
         )
     return hits
@@ -678,43 +684,71 @@ def probe(cfg: dict, dump: Path | None = None) -> int:
     # Control query. An empty response for 17 Sept could mean the date is not
     # on sale yet, or it could mean the request itself is malformed -- and those
     # look identical from the outside. Asking for a date that certainly does
-    # have showtimes separates them, and doubles as ground truth for the field
-    # names the matcher depends on.
+    # have showtimes separates them.
+    #
+    # It also does something more valuable: The Odyssey is playing right now, so
+    # running the real filter over today's data proves whether the filter can
+    # actually recognise a 70mm showing. Without that, a filter that matches
+    # nothing is indistinguishable from a date that has nothing -- and the first
+    # time we would find out is the day the tickets were missed.
     control_date = datetime.now(timezone.utc).date().isoformat()
-    ctl_id, ctl_name = theatres[0]
-    log(f"\n--- control: today ({control_date}) at {ctl_name} ---")
-    control = get_showtimes(api, ctl_id, control_date, cfg.get("language", "en"))
-    control_days = extract_days(control)
-    if not control_days:
-        log("  !! CONTROL FAILED: today returned nothing either.")
-        log(f"  !! shape: {describe_shape(control)}")
-        log("  !! The request format is probably wrong, not the date.")
-    else:
-        log(f"  control OK: {len(control_days)} date block(s) — the request format is correct.")
+    control: dict = {}
+    for ctl_id, ctl_name in theatres:
+        log(f"\n--- control: today ({control_date}) at {ctl_name} ---")
+        payload = get_showtimes(api, ctl_id, control_date, cfg.get("language", "en"))
+        control = payload or control
+        days = extract_days(payload)
+        if not days:
+            log(f"  !! CONTROL FAILED here: today returned nothing. shape: {describe_shape(payload)}")
+            continue
+
         films = [
             field(m, "name", "title", "filmName", "movieName")
-            for d in control_days
+            for d in days
             for m in (d.get("movies") or [])
         ]
-        log(f"  {len(films)} film(s) listed today, e.g. {films[:5]}")
-        sample = next(
-            (
-                (mv, ex, s)
-                for d in control_days
-                for mv in (d.get("movies") or [])
-                for ex in (mv.get("experiences") or [])
-                for s in (ex.get("sessions") or [])
-            ),
-            None,
-        )
-        if sample:
-            movie, experience, session = sample
-            log(f"  sample movie keys:      {sorted(movie.keys())}")
-            log(f"  sample experience keys: {sorted(experience.keys())}")
-            log(f"  sample experienceTypes: {json.dumps(experience.get('experienceTypes'))[:200]}")
-            log(f"  sample session:         {json.dumps(session)[:600]}")
-        odyssey = [f for f in films if matches_any(f, cfg.get("movieMatch") or [])]
-        log(f"  Odyssey titles showing today at this theatre: {odyssey or 'none'}")
+        log(f"  control OK: {len(days)} date block(s), {len(films)} film(s) listed.")
+
+        targets = [
+            (d, m)
+            for d in days
+            for m in (d.get("movies") or [])
+            if matches_any(field(m, "name", "title", "filmName", "movieName"), cfg.get("movieMatch") or [])
+        ]
+        if not targets:
+            log(f"  target film not showing here today. Films: {films[:8]}")
+            continue
+
+        for _day, movie in targets:
+            title = field(movie, "name", "title", "filmName", "movieName")
+            log(f"  '{title}' is showing today. Its experiences:")
+            for experience in movie.get("experiences") or []:
+                types = experience.get("experienceTypes")
+                sessions = experience.get("sessions") or []
+                blob = " ".join(
+                    [
+                        flatten_text(types),
+                        flatten_text(experience.get("name")),
+                        flatten_text(experience.get("experienceName")),
+                    ]
+                ).strip()
+                ok = matches_all(blob or title, cfg.get("formatMatchAll") or []) and matches_any(
+                    blob or title, cfg.get("formatMatchAny") or []
+                )
+                log(
+                    f"    {'PASSES' if ok else 'filtered out'}  "
+                    f"experienceTypes={json.dumps(types)}  ({len(sessions)} session(s))"
+                )
+                if sessions:
+                    log(f"      session keys: {sorted(sessions[0].keys())}")
+                    log(f"      session: {json.dumps(sessions[0])[:1800]}")
+
+        # The real matcher, over real data, for a date that actually has showings.
+        live = find_matches(payload, ctl_id, ctl_name, dict(cfg, targetDates=[control_date]))
+        log(f"  >> FILTER SELF-TEST: {len(live)} session(s) today would trigger an alert")
+        for hit in live[:6]:
+            log(f"       {describe(hit)}")
+            log(f"       link: {hit['url'] or '(none)'}")
 
     raw_dump: dict = {"control": control}
     strict_keys: set[str] = set()
