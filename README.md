@@ -34,8 +34,18 @@ Add these under **Settings → Secrets and variables → Actions → New reposit
 | `NTFY_TOKEN` | optional | Bearer token, if your ntfy topic is access-controlled. |
 | `CINEPLEX_API_KEY` | optional | Pin the API key instead of rediscovering it each run. |
 
-> Pick an unguessable `NTFY_TOPIC`. On ntfy.sh a topic is public to anyone who
-> knows its name — that only leaks showtimes, but a random suffix costs nothing.
+The workflow reads each of these from a **secret or a repository variable**, so
+either tab works. Secrets take precedence when both are set.
+
+Prefer secrets anyway. Repository variables are printed in plain text in workflow
+logs, and this repo is public — so a variable is world-readable the moment
+anything echoes it. Secrets are masked automatically. `NTFY_TOKEN` is
+secret-only for that reason.
+
+> Pick an unguessable `NTFY_TOPIC`. On ntfy.sh the topic name *is* the
+> credential: anyone who knows it can read your alerts and publish fake ones to
+> your phone. A random suffix costs nothing — `odyssey-70mm-a7f3q2`, not
+> `bps-ody`.
 
 Then confirm it works: **Actions → Watch Odyssey tickets → Run workflow →
 `test-notify`**. You should get a push within seconds. If nothing arrives, the
