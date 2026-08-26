@@ -12,14 +12,12 @@ still reach you, but you never get the same alert twice.
 
 ## Activation
 
-GitHub only runs `schedule` triggers from a repository's **default branch**.
-This repo was empty when the watcher landed, so GitHub made
-`claude/movie-ticket-notification-9xkufu` the default branch and the schedule
-runs from it as-is — nothing to merge.
+GitHub only runs `schedule` triggers from a repository's **default branch**, so
+the workflow has to live there. `main` carries it.
 
-If you later rename this branch or move to `main`, make sure the workflow ends
-up on whatever the default branch becomes, or the schedule stops firing.
-`workflow_dispatch` has the same rule, so manual runs need it there too.
+If you change the default branch, make sure the workflow moves with it or the
+schedule stops firing. `workflow_dispatch` has the same rule, so manual runs
+need it there too.
 
 ## Setup (one time, ~2 minutes)
 
