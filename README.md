@@ -10,6 +10,17 @@ The watcher polls every ~5 minutes from GitHub Actions and alerts only on
 showtimes it has not already told you about — so later waves for the same date
 still reach you, but you never get the same alert twice.
 
+## Activation
+
+GitHub only runs `schedule` triggers from a repository's **default branch**.
+This repo was empty when the watcher landed, so GitHub made
+`claude/movie-ticket-notification-9xkufu` the default branch and the schedule
+runs from it as-is — nothing to merge.
+
+If you later rename this branch or move to `main`, make sure the workflow ends
+up on whatever the default branch becomes, or the schedule stops firing.
+`workflow_dispatch` has the same rule, so manual runs need it there too.
+
 ## Setup (one time, ~2 minutes)
 
 The watcher runs on its own. It just needs somewhere to send the alert.
@@ -96,6 +107,9 @@ showtimes were found.
 - **GitHub disables scheduled workflows after 60 days of repo inactivity.** The
   state commits count as activity, but if nothing is ever found, re-run the
   workflow manually once in a while. For a 17 Sept target this is not a concern.
+- **Alerts go only where you point them.** Until `NTFY_TOPIC` or `WEBHOOK_URL`
+  is set, a run that finds showtimes logs them to the job summary and says no
+  channel is configured. It does not fail, so set at least one secret.
 - **`*/5` is a request, not a promise.** GitHub delays scheduled runs under
   load; 5–15 minutes is realistic.
 - **A failed run emails you** (GitHub does this by default for your own repos),
