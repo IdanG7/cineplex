@@ -5,6 +5,11 @@ on:
     # Every 5 minutes. GitHub delays scheduled runs under load, so treat this
     # as "roughly every 5-15 minutes" rather than a guarantee.
     - cron: "*/5 * * * *"
+  # Escape hatch for GitHub's scheduler, which did not fire once in the first
+  # hour on this repo. Any external cron can POST to the repository_dispatch
+  # API with {"event_type": "poll"} and drive the watcher directly.
+  repository_dispatch:
+    types: [poll]
   workflow_dispatch:
     inputs:
       mode:
@@ -52,7 +57,10 @@ jobs:
           esac
 
       - name: Record which showtimes were already reported
-        if: github.event_name == 'schedule' || inputs.mode == 'check'
+        # Every non-manual trigger is a real check and must record what it
+        # alerted on; without this a repository_dispatch run would re-send the
+        # same showtimes every few minutes forever.
+        if: github.event_name != 'workflow_dispatch' || inputs.mode == 'check'
         run: |
           if [[ -n "$(git status --porcelain state/)" ]]; then
             git config user.name  "cineplex-watcher"
