@@ -554,5 +554,80 @@ class TestSeatLookupIsFailSoft(unittest.TestCase):
         self.assertEqual(w.best_seats_for("7420", {}, SEAT_CFG), [])
 
 
+class TestRealSessionShape(unittest.TestCase):
+    """Field names and types confirmed from a live run on 2026-08-26.
+
+    Cineplex labels the format experienceTypes: ["IMAX", "70mm"], and the
+    ordinary showings of the same film ["Regular"].
+    """
+
+    LIVE = {
+        "seatMapUrl": "https://www.cineplex.com/en-Mobile/ticketing/preview?theatreId=7408&showtimeId=539537&dbox=False",
+        "ticketingUrl": "https://apis.cineplex.com/prod/ticketing/api/v1/routing/redirect-to-ticketing?VistaSessionId=539537&LocationId=7408",
+        "deeplinkUrl": "https://apis.cineplex.com/prod/cpx/theatrical/deeplink?s=539537&a=0000000001&l=7408&m=the-odyssey&ss=False",
+        "vistaSessionId": 539537,
+        "showStartDateTime": "2026-08-26T11:00:00",
+        "showStartDateTimeUtc": "2026-08-26T15:00:00Z",
+        "isInThePast": False,
+        "isReservedSeating": True,
+        "isShowtimeEnabledOnline": True,
+        "seatsRemaining": 31,
+        "isSoldOut": False,
+        "auditorium": "IMAX",
+    }
+
+    def live_payload(self, experience_types, date="2026-09-17"):
+        return {
+            "theatreId": "7408",
+            "dates": [{
+                "startDate": f"{date}T00:00:00",
+                "movies": [{
+                    "id": "the-odyssey",
+                    "name": "The Odyssey",
+                    "experiences": [{
+                        "experienceTypes": experience_types,
+                        "sessions": [dict(self.LIVE, showStartDateTime=f"{date}T11:00:00")],
+                    }],
+                }],
+            }],
+        }
+
+    def test_the_real_imax_70mm_label_matches(self):
+        hits = w.find_matches(self.live_payload(["IMAX", "70mm"]), "7408", "Vaughan", CONFIG)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["seatsRemaining"], 31)
+        self.assertEqual(hits[0]["auditorium"], "IMAX")
+
+    def test_the_real_regular_label_is_rejected(self):
+        # Same film, ordinary screen. This is the false alarm that matters.
+        self.assertEqual(w.find_matches(self.live_payload(["Regular"]), "7408", "V", CONFIG), [])
+
+    def test_other_premium_formats_are_rejected(self):
+        for types in (["UltraAVX", "3D", "D-BOX", "Dolby Atmos"], ["IMAX"], ["70mm"]):
+            self.assertEqual(w.find_matches(self.live_payload(types), "7408", "V", CONFIG), [], types)
+
+    def test_the_integer_session_id_becomes_the_dedup_key(self):
+        hits = w.find_matches(self.live_payload(["IMAX", "70mm"]), "7408", "V", CONFIG)
+        self.assertEqual(hits[0]["key"], "7408:539537")
+
+    def test_the_booking_link_is_the_deeplink(self):
+        hits = w.find_matches(self.live_payload(["IMAX", "70mm"]), "7408", "V", CONFIG)
+        self.assertTrue(hits[0]["url"].startswith("https://apis.cineplex.com/prod/cpx/theatrical/deeplink"))
+
+    def test_the_seat_lookup_finds_the_integer_showtime_id(self):
+        self.assertEqual(w.session_showtime_id(self.LIVE), "539537")
+
+    def test_the_key_is_stable_across_runs(self):
+        first = w.find_matches(self.live_payload(["IMAX", "70mm"]), "7408", "V", CONFIG)
+        second = w.find_matches(self.live_payload(["IMAX", "70mm"]), "7408", "V", CONFIG)
+        self.assertEqual(first[0]["key"], second[0]["key"])
+
+    def test_a_session_with_no_id_still_gets_a_usable_key(self):
+        bare = {k: v for k, v in self.LIVE.items()
+                if k not in ("vistaSessionId", "seatMapUrl", "ticketingUrl", "deeplinkUrl")}
+        key = w.session_key("7408", "2026-09-17", bare)
+        self.assertEqual(key, "7408:2026-09-17:2026-08-26T11:00:00")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

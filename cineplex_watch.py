@@ -355,9 +355,16 @@ def iter_sessions(payload: dict, target_dates: list[str]):
 
 
 def session_key(theatre_id: str, date_iso: str, session: dict) -> str:
-    vista = field(session, "vistaSessionId", "sessionId", "id")
-    if vista:
-        return f"{theatre_id}:{vista}"
+    """Stable identity for one showing, used as the dedup ledger key.
+
+    Live data returns vistaSessionId as an integer (539537), which the
+    string-only `field` helper dropped -- silently falling back to the
+    date-and-time composite. That still deduped correctly, but the id is the
+    better key, so go through the same resolver the seat lookup uses.
+    """
+    showtime_id = session_showtime_id(session)
+    if showtime_id:
+        return f"{theatre_id}:{showtime_id}"
     return f"{theatre_id}:{date_iso}:{field(session, 'showStartDateTime')}"
 
 
