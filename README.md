@@ -107,7 +107,7 @@ quietly widened the filter would prove nothing.
 
 The alert does not just say a showtime opened — it says which seats to take.
 When a matching showtime appears the watcher pulls the live seat map from
-Cineplex's ticketing API (no auth needed) and ranks every run of 5 adjacent
+Cineplex's ticketing API (no auth needed) and ranks every run of 6 adjacent
 seats, best first.
 
 The ranking comes from how IMAX 1.43:1 is meant to be watched. The Odyssey is
@@ -121,9 +121,12 @@ shot entirely in that ratio, so the frame is floor-to-ceiling tall:
 - **Dead centre horizontally.** Centres you in the 12-channel audio field and
   avoids the keystoning you get from the sides of a curved screen.
 
-Five is an awkward number: an odd block cannot straddle the centre of an
-even-width row, so the best it can do is half a seat off. The ranker accepts
-that rather than giving up the right row.
+The alert never sells a bad seat as a good one. Each pick carries a plain
+verdict — `ideal`, `a bit close`, `front row`, `very back`, `good row,
+off-centre` — because the ranker returns the best block that *exists*, and on
+a picked-over showing that can be row A. It also distinguishes "no 6 can sit
+together here (longest run 4)" from "the seat map could not be read", which
+otherwise look identical.
 
 Two rules it will not break: a block never straddles an aisle (a gap in the
 column numbering), and accessible and companion seats are never recommended.
@@ -132,7 +135,7 @@ Tune it in `watch.config.json`:
 
 ```jsonc
 "seats": {
-  "partySize": 5,
+  "partySize": 6,
   "targetRowFraction": 0.65,   // 0 = front row, 1 = back row
   "rowWeight": 1.0,            // how much row position matters
   "centerWeight": 0.8,         // ...versus being centred
@@ -142,7 +145,7 @@ Tune it in `watch.config.json`:
 ```
 
 If the seat map cannot be read, the alert still goes out — it just falls back
-to telling you to pick 5 together, centre, two thirds back. Losing the alert
+to telling you to pick 6 together, centre, two thirds back. Losing the alert
 because the seat API hiccuped would be the worst possible failure.
 
 ## Changing what it watches

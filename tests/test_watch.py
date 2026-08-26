@@ -543,15 +543,17 @@ class TestSeatLookupIsFailSoft(unittest.TestCase):
     def tearDown(self):
         w.http_get_json = self._real
 
-    def test_a_failing_seat_api_returns_no_blocks_and_does_not_raise(self):
+    def test_a_failing_seat_api_reports_unreadable_and_does_not_raise(self):
         def boom(*a, **k):
             raise OSError("ticketing API down")
 
         w.http_get_json = boom
-        self.assertEqual(w.best_seats_for("7420", {"vistaSessionId": "1"}, SEAT_CFG), [])
+        report = w.best_seats_for("7420", {"vistaSessionId": "1"}, SEAT_CFG)
+        self.assertFalse(report["readable"])
+        self.assertEqual(report["blocks"], [])
 
     def test_a_session_with_no_showtime_id_is_skipped_quietly(self):
-        self.assertEqual(w.best_seats_for("7420", {}, SEAT_CFG), [])
+        self.assertFalse(w.best_seats_for("7420", {}, SEAT_CFG)["readable"])
 
 
 class TestRealSessionShape(unittest.TestCase):
@@ -668,6 +670,103 @@ class TestRehearsalIsSafe(unittest.TestCase):
         self.assertEqual(cfg["formatMatchAll"], CONFIG["formatMatchAll"])
         self.assertEqual(cfg["formatMatchAny"], CONFIG["formatMatchAny"])
         self.assertEqual(cfg["seats"], CONFIG["seats"])
+
+
+class TestSeatQuality(unittest.TestCase):
+    """The ranker returns the best block that exists, which on a picked-over
+    showing is the front row. Calling that 'best' with no caveat is how you
+    end up sitting in row A for a three-hour 1.43:1 film."""
+
+    def q(self, back, offset=0.0):
+        return w.seat_quality({"rowFraction": back, "centreOffset": offset})
+
+    def test_the_front_of_the_house_is_called_out(self):
+        self.assertEqual(self.q(0.04), "front row")
+        self.assertEqual(self.q(0.20), "front row")
+
+    def test_slightly_forward_is_flagged_but_not_condemned(self):
+        self.assertEqual(self.q(0.30), "a bit close")
+
+    def test_the_sweet_spot_is_ideal(self):
+        self.assertEqual(self.q(0.65), "ideal")
+        self.assertEqual(self.q(0.50), "ideal")
+
+    def test_the_back_wall_is_called_out(self):
+        self.assertEqual(self.q(0.95), "very back")
+
+    def test_a_good_row_off_to_one_side_is_not_ideal(self):
+        self.assertEqual(self.q(0.65, offset=0.6), "good row, off-centre")
+
+
+class TestAlertFormatting(unittest.TestCase):
+    def test_seat_labels_do_not_repeat_the_row(self):
+        block = {"row": "H", "seats": ["H8", "H9", "H10"], "rowFraction": 0.6, "centreOffset": 0}
+        self.assertEqual(w.format_block(block), "H8-H10")
+
+    def test_bare_numeric_labels_get_the_row_prefixed(self):
+        block = {"row": "H", "seats": ["8", "9", "10"], "rowFraction": 0.6, "centreOffset": 0}
+        self.assertEqual(w.format_block(block), "H8-H10")
+
+    def test_the_chain_boilerplate_is_dropped(self):
+        self.assertEqual(w.short_theatre("Cineplex Cinemas Vaughan"), "Vaughan")
+        self.assertEqual(w.short_theatre("Scotiabank Theatre Bayers Lake"), "Bayers Lake")
+        self.assertEqual(w.short_theatre("The Kramer IMAX"), "The Kramer IMAX")
+
+    def _hit(self, **kw):
+        base = {"theatre": "Cineplex Cinemas Vaughan", "theatreId": "7408",
+                "date": "2026-09-17", "start": "2026-09-17T19:00:00",
+                "seatsRemaining": 300, "isSoldOut": False, "url": "https://x",
+                "movie": "The Odyssey", "format": "IMAX 70mm", "key": "k"}
+        base.update(kw)
+        return base
+
+    def test_a_good_block_reads_as_a_seat_instruction(self):
+        report = {"readable": True, "largest": 20, "blocks": [
+            {"row": "H", "seats": ["H10", "H11", "H12", "H13", "H14", "H15"],
+             "rowFraction": 0.62, "centreOffset": 0.05}]}
+        line = w.showtime_line(self._hit(seatReport=report), 6)
+        self.assertIn("H10-H15", line)
+        self.assertIn("ideal", line)
+        self.assertIn("(300 left)", line)
+
+    def test_no_block_for_the_party_says_so_and_names_the_longest_run(self):
+        report = {"readable": True, "largest": 4, "blocks": []}
+        line = w.showtime_line(self._hit(seatReport=report), 6)
+        self.assertIn("no 6 together", line)
+        self.assertIn("longest run 4", line)
+
+    def test_an_unreadable_seat_map_is_distinct_from_no_seats(self):
+        line = w.showtime_line(self._hit(seatReport={"readable": False, "blocks": [], "largest": 0}), 6)
+        self.assertIn("unreadable", line)
+        self.assertNotIn("no 6 together", line)
+
+    def test_sold_out_short_circuits(self):
+        line = w.showtime_line(self._hit(isSoldOut=True, seatReport={}), 6)
+        self.assertIn("SOLD OUT", line)
+
+    def test_showtimes_are_grouped_under_each_theatre(self):
+        hits = [
+            self._hit(theatre="Cineplex Cinemas Vaughan", start="2026-09-17T19:00:00", seatReport={}),
+            self._hit(theatre="Cineplex Cinemas Mississauga Square One",
+                      start="2026-09-17T13:30:00", seatReport={}),
+            self._hit(theatre="Cineplex Cinemas Vaughan", start="2026-09-17T13:00:00", seatReport={}),
+        ]
+        _title, body, _link = w.build_message(hits, CONFIG)
+        self.assertEqual(body.count("VAUGHAN"), 1)
+        self.assertEqual(body.count("MISSISSAUGA SQUARE ONE"), 1)
+        # Chronological within a theatre.
+        vaughan = body.split("VAUGHAN")[1]
+        self.assertLess(vaughan.index("1:00 PM"), vaughan.index("7:00 PM"))
+
+    def test_the_header_states_the_party_size_and_the_date(self):
+        _t, body, _l = w.build_message([self._hit(seatReport={})], CONFIG)
+        self.assertIn("6 together", body)
+        self.assertIn("Thu 17 Sep", body)
+
+    def test_the_title_counts_the_showtimes(self):
+        title, _b, _l = w.build_message([self._hit(seatReport={})], CONFIG)
+        self.assertIn("1 showtime", title)
+        self.assertNotIn("1 showtimes", title)
 
 
 if __name__ == "__main__":

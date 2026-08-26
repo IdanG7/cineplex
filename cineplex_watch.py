@@ -573,12 +573,43 @@ def rank_seat_blocks(layout, avail, cfg: dict) -> list[dict]:
                 {
                     "row": field(row, "label", "rowLabel", "name") or str(index + 1),
                     "rowFraction": round(row_frac, 3),
+                    "centreOffset": round(center_penalty, 3),
                     "seats": [field(s, "label", "seatLabel", "name") or str(seat_column(s)) for s in block],
                     "score": round(row_weight * row_penalty + center_weight * center_penalty, 4),
                 }
             )
     ranked.sort(key=lambda b: b["score"])
     return ranked
+
+
+def largest_run(layout, avail, cfg: dict) -> int:
+    """Longest stretch of adjacent bookable seats anywhere in the house.
+
+    When no block of the full party size exists, this is what makes the
+    difference between "the seat map broke" and "this showing cannot seat you
+    together" -- two situations that otherwise look identical in the alert.
+    """
+    spec = cfg.get("seats") or {}
+    avoid = [a.lower() for a in (spec.get("avoidSeatTypes") or [])]
+    statuses = availability_map(avail)
+    best = 0
+    for row in find_record_list(layout, looks_like_row) or []:
+        free = []
+        for seat in row.get("seats") or []:
+            sid = str(seat.get("id", seat.get("seatId", "")))
+            if seat_is_taken(statuses.get(sid)):
+                continue
+            if avoid and any(a in str(seat.get("type", "")).lower() for a in avoid):
+                continue
+            free.append(seat)
+        columns = sorted(c for c in (seat_column(s) for s in free) if c is not None)
+        run = 0
+        previous = None
+        for column in columns:
+            run = run + 1 if previous is not None and column == previous + 1 else 1
+            previous = column
+            best = max(best, run)
+    return best
 
 
 def describe_seats(block: dict) -> str:
@@ -588,22 +619,33 @@ def describe_seats(block: dict) -> str:
     return f"row {block['row']} seats {span} ({back}% back)"
 
 
-def best_seats_for(theatre_id: str, session: dict, cfg: dict) -> list[dict]:
-    """Best blocks for one showtime, or [] if the seat map cannot be read.
+def best_seats_for(theatre_id: str, session: dict, cfg: dict) -> dict:
+    """Seat report for one showtime.
+
+    Returns {"readable": bool, "blocks": [...], "largest": int}, which lets the
+    alert distinguish three cases that would otherwise read the same: the seat
+    map could not be fetched, it was fetched but nothing seats the whole party
+    together, or here are the best seats.
 
     Never raises: a seat lookup that fails must not cost the alert itself.
     """
+    blank = {"readable": False, "blocks": [], "largest": 0}
     showtime_id = session_showtime_id(session)
     if not showtime_id:
-        return []
+        return blank
     base = f"{TICKETING_API}/theatre/{theatre_id}/showtime/{showtime_id}"
     try:
         layout = http_get_json(f"{base}/seat-layout")
         avail = http_get_json(f"{base}/seat-availability")
     except Exception as exc:
         log(f"    seat map unavailable for showtime {showtime_id}: {exc}")
-        return []
-    return rank_seat_blocks(layout, avail, cfg)[: int((cfg.get("seats") or {}).get("topN", 3))]
+        return blank
+    top = int((cfg.get("seats") or {}).get("topN", 3))
+    return {
+        "readable": True,
+        "blocks": rank_seat_blocks(layout, avail, cfg)[:top],
+        "largest": largest_run(layout, avail, cfg),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -617,6 +659,13 @@ def pretty_time(value: str) -> str:
         return value or "time TBA"
 
 
+def pretty_date(value: str) -> str:
+    try:
+        return datetime.fromisoformat(value).strftime("%a %-d %b")
+    except Exception:
+        return value
+
+
 def describe(hit: dict) -> str:
     bits = [pretty_time(hit["start"]), hit["theatre"]]
     if hit.get("auditorium"):
@@ -628,18 +677,103 @@ def describe(hit: dict) -> str:
     return " · ".join(bits)
 
 
+THEATRE_PREFIXES = (
+    "Cineplex Cinemas ",
+    "Cineplex Odeon ",
+    "Scotiabank Theatre ",
+    "Cinéma Banque Scotia ",
+    "SilverCity ",
+    "Galaxy Cinemas ",
+)
+
+
+def short_theatre(name: str) -> str:
+    """Drop the chain boilerplate; on a phone the branch is the useful part."""
+    for prefix in THEATRE_PREFIXES:
+        if name.startswith(prefix):
+            return name[len(prefix) :]
+    return name
+
+
+def pretty_clock(value: str) -> str:
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).strftime("%-I:%M %p")
+    except Exception:
+        return value or "?"
+
+
+def seat_quality(block: dict) -> str:
+    """A plain verdict on a block, so a bad seat is never sold as a good one.
+
+    The ranker returns the best block that exists, which on a nearly-full
+    showing can be the front row. Saying so is the difference between useful
+    and misleading.
+    """
+    back = block.get("rowFraction", 0)
+    off_centre = block.get("centreOffset", 0) > 0.2
+    if back < 0.25:
+        return "front row"
+    if back < 0.40:
+        return "a bit close"
+    if back > 0.85:
+        return "very back"
+    if off_centre:
+        return "good row, off-centre"
+    return "ideal"
+
+
+def format_block(block: dict) -> str:
+    """"H8-H13". Seat labels often already carry the row, so do not repeat it."""
+    labels = block["seats"]
+    first, last = labels[0], labels[-1]
+    row = str(block.get("row") or "")
+    if row and first.upper().startswith(row.upper()):
+        return f"{first}-{last}"
+    return f"{row}{first}-{row}{last}"
+
+
+def showtime_line(hit: dict, size: int | None) -> str:
+    when = pretty_clock(hit["start"])
+    left = hit.get("seatsRemaining")
+    tail = f"  ({left} left)" if isinstance(left, int) else ""
+    if hit.get("isSoldOut"):
+        return f"{when:>8}  SOLD OUT"
+
+    report = hit.get("seatReport") or {}
+    blocks = report.get("blocks") or []
+    if blocks:
+        best = blocks[0]
+        return f"{when:>8}  {format_block(best):<11} {seat_quality(best)}{tail}"
+    if report.get("readable"):
+        largest = report.get("largest", 0)
+        run = f"longest run {largest}" if largest else "nothing adjacent"
+        return f"{when:>8}  no {size} together ({run}){tail}"
+    if size:
+        return f"{when:>8}  seat map unreadable{tail}"
+    return f"{when:>8}{tail}"
+
+
 def build_message(hits: list[dict], cfg: dict) -> tuple[str, str, str]:
     label = cfg.get("label") or "Showtimes"
-    title = f"{label} — {len(hits)} new showtime{'s' if len(hits) != 1 else ''}"
     size = (cfg.get("seats") or {}).get("partySize")
-    lines = []
+    count = len(hits)
+    title = f"{label} — {count} showtime{'s' if count != 1 else ''}"
+
+    dates = sorted({h["date"] for h in hits})
+    when = pretty_date(dates[0]) if len(dates) == 1 else f"{len(dates)} dates"
+    header = f"{size} together · {when}" if size else when
+
+    grouped: dict[str, list[dict]] = {}
     for hit in hits:
-        lines.append(describe(hit))
-        blocks = hit.get("bestSeats") or []
-        if blocks:
-            lines.append(f"   best {size}: " + "; ".join(describe_seats(b) for b in blocks[:2]))
-        elif size:
-            lines.append(f"   (seat map not readable — pick {size} together, centre, ~2/3 back)")
+        grouped.setdefault(short_theatre(hit["theatre"]), []).append(hit)
+
+    lines = [header]
+    for theatre, group in grouped.items():
+        lines.append("")
+        lines.append(theatre.upper())
+        for hit in sorted(group, key=lambda h: h["start"]):
+            lines.append(showtime_line(hit, size))
+
     link = next((h["url"] for h in hits if h.get("url")), cfg.get("fallbackUrl", HOMEPAGE))
     return title, "\n".join(lines), link
 
@@ -817,7 +951,7 @@ def run_check(cfg: dict, state_path: Path, dry_run: bool, fixture: Path | None) 
         size = cfg["seats"]["partySize"]
         log(f"looking up best {size} adjacent seats for each new showtime...")
         for hit in fresh:
-            hit["bestSeats"] = best_seats_for(hit["theatreId"], hit.get("session") or {}, cfg)
+            hit["seatReport"] = best_seats_for(hit["theatreId"], hit.get("session") or {}, cfg)
 
     title, body, link = build_message(fresh, cfg)
     log(f"\n{title}\n{body}\n{link}\n")
