@@ -513,7 +513,8 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="report but do not notify or save state")
     parser.add_argument("--fixture", type=Path, help="parse a local JSON file instead of calling the API")
     parser.add_argument("--test-notify", action="store_true", help="send a test alert and exit")
-    parser.add_argument("--probe", action="store_true", help="dump what is listed, to verify config")
+    parser.add_argument("--probe", action="store_true", help="show what the API actually returns")
+    parser.add_argument("--dump", type=Path, help="with --probe, save the raw API responses here")
     args = parser.parse_args()
 
     if args.test_notify:
@@ -529,30 +530,96 @@ def main() -> int:
         cfg["targetDates"] = args.date
 
     if args.probe:
-        return probe(cfg)
+        return probe(cfg, args.dump)
 
     return run_check(cfg, args.state, args.dry_run, args.fixture)
 
 
-def probe(cfg: dict) -> int:
-    """Show every session for the target film at the configured theatres.
+def probe(cfg: dict, dump: Path | None = None) -> int:
+    """Print what the API actually returns, so a miss can be diagnosed.
 
-    Format and date filters are dropped so a miss can be told apart from a
-    config that is quietly matching nothing.
+    The point of this mode is to distinguish three very different situations
+    that all look identical from the outside: the showtimes genuinely are not
+    on sale yet, the theatre names no longer resolve, or the response shape
+    changed and the matcher is reading fields that are not there any more.
     """
     api = Api(get_subscription_key())
     theatres = resolve_theatres(api, cfg)
-    log(f"resolved {len(theatres)} theatre(s)")
-    loose = dict(cfg, formatMatchAll=[], formatMatchAny=[], targetDates=[], requireBookable=False)
+    log(f"\nresolved {len(theatres)} theatre(s) from the live catalogue:")
     for tid, name in theatres:
-        log(f"\n=== {name} (id {tid}) ===")
+        log(f"  id={tid}  {name}")
+    if not theatres:
+        log("  !! nothing matched `theatres[].nameContains` in the config")
+        return 1
+
+    raw_dump: dict = {}
+    strict_keys: set[str] = set()
+    total_sessions = 0
+
+    for tid, name in theatres:
         for date_iso in cfg.get("targetDates") or []:
+            log(f"\n=== {name} (id {tid}) — queried date {date_iso} ===")
             payload = get_showtimes(api, tid, date_iso, cfg.get("language", "en"))
-            days = [date_prefix(d.get("startDate") or d.get("date")) for d in payload.get("dates") or []]
-            log(f"  query date {date_iso} -> dates returned: {days or 'none'}")
-            for hit in find_matches(payload, tid, name, loose):
-                flag = "MATCH" if find_matches(payload, tid, name, cfg) else "     "
-                log(f"  {flag} {hit['date']} {hit['format']:<28} {describe(hit)}")
+            raw_dump[f"{tid}@{date_iso}"] = payload
+
+            log(f"  top-level keys: {sorted(payload.keys())}")
+            days = payload.get("dates") or []
+            if not days:
+                log("  !! no `dates` array in the response -- shape may have changed")
+                continue
+            log(f"  {len(days)} date block(s): "
+                f"{[date_prefix(d.get('startDate') or d.get('date')) for d in days]}")
+
+            for hit in find_matches(payload, tid, name, cfg):
+                strict_keys.add(hit["key"])
+
+            for day in days:
+                day_iso = date_prefix(day.get("startDate") or day.get("date"))
+                movies = day.get("movies") or []
+                marker = ">>" if day_iso in (cfg.get("targetDates") or []) else "  "
+                log(f"  {marker} {day_iso}: {len(movies)} film(s)")
+                if day_iso not in (cfg.get("targetDates") or []):
+                    continue
+                for movie in movies:
+                    title = field(movie, "name", "title", "filmName", "movieName")
+                    if not title:
+                        log(f"       !! film with no recognisable title; keys={sorted(movie.keys())}")
+                        continue
+                    on_target = matches_any(title, cfg.get("movieMatch") or [])
+                    log(f"       {'*' if on_target else ' '} {title}")
+                    if not on_target:
+                        continue
+                    for experience in movie.get("experiences") or []:
+                        fmt = flatten_text(experience.get("experienceTypes")) or "(no experienceTypes)"
+                        sessions = experience.get("sessions") or []
+                        total_sessions += len(sessions)
+                        log(f"           format: {fmt!r} -> {len(sessions)} session(s)")
+                        for session in sessions:
+                            key = session_key(tid, day_iso, session)
+                            log(
+                                f"             {'MATCH' if key in strict_keys else '     '} "
+                                f"{field(session, 'showStartDateTime') or '(no showStartDateTime)'}"
+                                f"  aud={field(session, 'auditorium') or '?'}"
+                                f"  seats={session.get('seatsRemaining', '?')}"
+                                f"  soldOut={session.get('isSoldOut', '?')}"
+                                f"  bookable={session.get('isShowtimeEnabledOnline', '?')}"
+                            )
+                            log(f"               session keys: {sorted(session.keys())}")
+
+    log(
+        f"\nSUMMARY: {total_sessions} session(s) listed for the target film on the "
+        f"target date(s); {len(strict_keys)} pass the configured format filter."
+    )
+    if total_sessions and not strict_keys:
+        log("  -> the film is listed but nothing matched the format filter."
+            " Compare the 'format:' lines above against formatMatchAll/formatMatchAny.")
+    elif not total_sessions:
+        log("  -> the film is not listed for that date yet. This is the expected"
+            " state until Cineplex opens the date.")
+
+    if dump:
+        dump.write_text(json.dumps(raw_dump, indent=2)[:5_000_000], encoding="utf-8")
+        log(f"\nraw API responses written to {dump}")
     return 0
 
 

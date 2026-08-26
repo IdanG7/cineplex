@@ -41,6 +41,28 @@ Then confirm it works: **Actions → Watch Odyssey tickets → Run workflow →
 `test-notify`**. You should get a push within seconds. If nothing arrives, the
 run log will say which channel failed and why.
 
+## Proving it actually works
+
+The fastest way to confirm the watcher reads real theatres, showtimes and seat
+counts is to run the probe yourself on any machine with internet:
+
+```bash
+git clone https://github.com/IdanG7/cineplex && cd cineplex
+python3 cineplex_watch.py --probe
+```
+
+No dependencies, no secrets, nothing is sent anywhere. It prints the theatre ids
+it resolved from Cineplex's live catalogue, every film listed on the target date,
+the exact format string on each showing, and the seat count and booking status of
+every session — marking which ones the filter would alert on. It ends with a
+plain summary that separates the three cases that otherwise look identical:
+
+- *the film is not listed for that date yet* — expected, until Cineplex opens it
+- *listed, but nothing matched the format filter* — the filter needs adjusting
+- *matched N sessions* — the watcher is working
+
+Add `--dump raw.json` to save the untouched API responses.
+
 ## Checking on it
 
 From the **Actions** tab, `Run workflow` gives you four modes:
