@@ -17,6 +17,7 @@ Runs unattended from GitHub Actions. Standard library only.
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import os
 import re
@@ -24,6 +25,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -50,28 +52,54 @@ def log(msg: str) -> None:
 # HTTP
 # --------------------------------------------------------------------------
 
-def http_get(url: str, headers: dict | None = None, timeout: int = 30) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, **(headers or {})})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read()
+def decompress(raw: bytes, content_encoding: str | None) -> bytes:
+    """Undo whatever transfer encoding the response arrived in.
+
+    Cineplex gzips regardless of what Accept-Encoding asks for, so the magic
+    bytes are trusted ahead of the header. A header claiming a compression the
+    body does not actually use is ignored rather than fatal: the empty body
+    Cineplex returns for a date with no showtimes is this watcher's normal
+    state, and must never be the thing that takes a run down.
+    """
+    if not raw:
+        return raw
+    if raw[:2] == b"\x1f\x8b":
+        return gzip.decompress(raw)
+    if "deflate" in (content_encoding or "").lower():
+        for wbits in (zlib.MAX_WBITS, -zlib.MAX_WBITS):
+            try:
+                return zlib.decompress(raw, wbits)
+            except zlib.error:
+                continue
+    return raw
 
 
-def http_get_json(url: str, headers: dict | None = None, timeout: int = 30) -> dict:
+def fetch(url: str, headers: dict | None = None, timeout: int = 30):
+    """GET a URL, returning (status, headers, decompressed body)."""
     req = urllib.request.Request(
         url,
         headers={
             "User-Agent": USER_AGENT,
-            "Accept": "application/json",
-            # urllib does not negotiate compression; say so explicitly rather
-            # than risk being handed a gzip body we would fail to decode.
-            "Accept-Encoding": "identity",
+            "Accept-Encoding": "gzip, deflate",
             **(headers or {}),
         },
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read()
-        status = resp.status
-        ctype = resp.headers.get("Content-Type", "")
+        body = resp.read()
+        headers_out = resp.headers
+        status = getattr(resp, "status", 200)
+    return status, headers_out, decompress(body, headers_out.get("Content-Encoding"))
+
+
+def http_get(url: str, headers: dict | None = None, timeout: int = 30) -> bytes:
+    return fetch(url, headers, timeout)[2]
+
+
+def http_get_json(url: str, headers: dict | None = None, timeout: int = 30) -> dict:
+    status, resp_headers, raw = fetch(
+        url, {"Accept": "application/json", **(headers or {})}, timeout
+    )
+    ctype = resp_headers.get("Content-Type", "")
 
     if not raw.strip():
         # Cineplex answers a date with nothing on it with an empty body rather

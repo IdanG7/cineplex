@@ -320,5 +320,84 @@ class TestEmptyBodyHandling(unittest.TestCase):
         self.assertEqual(w.extract_days({}), [])
 
 
+class TestCompressedResponses(unittest.TestCase):
+    """Cineplex gzips its showtimes responses and ignores Accept-Encoding:
+    identity. Decoding the raw bytes as UTF-8 died on the gzip magic number."""
+
+    import gzip as _gzip
+    import zlib as _zlib
+
+    class FakeResponse:
+        def __init__(self, body, encoding=None, status=200):
+            self._body = body
+            self.status = status
+            self.headers = {"Content-Type": "application/json"}
+            if encoding:
+                self.headers["Content-Encoding"] = encoding
+
+        def read(self):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def setUp(self):
+        self._real = w.urllib.request.urlopen
+
+    def tearDown(self):
+        w.urllib.request.urlopen = self._real
+
+    def _serve(self, body, encoding=None):
+        w.urllib.request.urlopen = lambda req, timeout=None: self.FakeResponse(body, encoding)
+        return w.http_get_json("https://example.com/x")
+
+    def test_gzip_body_with_a_content_encoding_header(self):
+        packed = self._gzip.compress(b'{"dates": [{"movies": []}]}')
+        self.assertEqual(self._serve(packed, "gzip"), {"dates": [{"movies": []}]})
+
+    def test_gzip_body_with_no_header_is_sniffed_by_magic_bytes(self):
+        # This is the real-world case: the header did not admit to gzip.
+        packed = self._gzip.compress(b'{"ok": true}')
+        self.assertEqual(self._serve(packed), {"ok": True})
+
+    def test_deflate_body(self):
+        self.assertEqual(self._serve(self._zlib.compress(b'{"ok": 1}'), "deflate"), {"ok": 1})
+
+    def test_raw_deflate_without_a_zlib_header(self):
+        comp = self._zlib.compressobj(wbits=-self._zlib.MAX_WBITS)
+        packed = comp.compress(b'{"ok": 2}') + comp.flush()
+        self.assertEqual(self._serve(packed, "deflate"), {"ok": 2})
+
+    def test_uncompressed_body_is_untouched(self):
+        self.assertEqual(self._serve(b'{"plain": true}'), {"plain": True})
+
+    def test_empty_body_still_yields_an_empty_dict(self):
+        self.assertEqual(self._serve(b""), {})
+
+    def test_decompress_passes_through_when_there_is_nothing_to_do(self):
+        self.assertEqual(w.decompress(b"hello", None), b"hello")
+        self.assertEqual(w.decompress(b"", "gzip"), b"")
+
+    def test_a_lying_gzip_header_on_an_uncompressed_body_is_not_fatal(self):
+        # gzip.decompress() raises BadGzipFile here; the bytes win over the header.
+        self.assertEqual(w.decompress(b"   ", "gzip"), b"   ")
+        self.assertEqual(self._serve(b'{"ok": 3}', "gzip"), {"ok": 3})
+
+    def test_a_lying_deflate_header_is_not_fatal(self):
+        self.assertEqual(w.decompress(b"not deflate", "deflate"), b"not deflate")
+
+    def test_an_empty_body_labelled_gzip_is_still_just_empty(self):
+        self.assertEqual(self._serve(b"", "gzip"), {})
+
+    def test_a_gzipped_showtimes_payload_survives_end_to_end(self):
+        packed = self._gzip.compress(json.dumps(FIXTURE).encode())
+        payload = self._serve(packed, "gzip")
+        keys = {h["key"].split(":")[-1] for h in w.find_matches(payload, "7420", "T", CONFIG)}
+        self.assertEqual(keys, {"HIT-A", "HIT-B", "HIT-C-TITLE-ONLY"})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
