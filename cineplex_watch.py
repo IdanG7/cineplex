@@ -23,6 +23,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -128,6 +129,32 @@ def http_post(url: str, data: bytes, headers: dict | None = None, timeout: int =
 # Subscription key
 # --------------------------------------------------------------------------
 
+def fetch_homepage_chunk_paths(attempts: int = 3) -> list[str]:
+    """Fetch the Cineplex homepage and return its Next.js chunk paths.
+
+    Cineplex's bot mitigation occasionally answers a scripted request with a
+    403, or with a page that has no chunks in it at all -- both observed in
+    the wild, both gone on the very next request a couple of seconds later.
+    A few quick retries turns that transient noise into a slightly slower run
+    instead of a failed one; only a mitigation that holds for several seconds
+    straight should still take the run down.
+    """
+    last_exc: Exception = RuntimeError("no Next.js chunk URLs found on the Cineplex homepage")
+    for attempt in range(1, attempts + 1):
+        try:
+            home = http_get(HOMEPAGE).decode("utf-8", "replace")
+            paths = list(dict.fromkeys(CHUNK_PATH_RE.findall(home)))
+            if paths:
+                return paths
+            last_exc = RuntimeError("no Next.js chunk URLs found on the Cineplex homepage")
+        except urllib.error.HTTPError as exc:
+            last_exc = exc
+        if attempt < attempts:
+            log(f"  homepage fetch attempt {attempt} came back empty/blocked ({last_exc}) -- retrying")
+            time.sleep(2 * attempt)
+    raise last_exc
+
+
 def discover_subscription_key(max_chunks: int = 60) -> str:
     """Scrape the API key out of Cineplex's own Next.js bundles.
 
@@ -135,10 +162,7 @@ def discover_subscription_key(max_chunks: int = 60) -> str:
     each run means a key rotation on their side fixes itself instead of
     silently breaking the watcher.
     """
-    home = http_get(HOMEPAGE).decode("utf-8", "replace")
-    paths = list(dict.fromkeys(CHUNK_PATH_RE.findall(home)))
-    if not paths:
-        raise RuntimeError("no Next.js chunk URLs found on the Cineplex homepage")
+    paths = fetch_homepage_chunk_paths()
 
     log(f"  scanning {min(len(paths), max_chunks)} of {len(paths)} JS chunks for the API key")
     relevant: list[str] = []
