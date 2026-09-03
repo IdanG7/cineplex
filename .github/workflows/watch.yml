@@ -14,7 +14,7 @@ on:
     # nobody else picks, is far likelier to actually be honoured. The
     # external cron in SETUP-CRON.md carries the 5-minute resolution; this is
     # the backstop, and a backstop that runs beats one that does not.
-    - cron: "7,22,37,52 * * * *"
+
   # Escape hatch for GitHub's scheduler, which did not fire once in the first
   # hour on this repo. Any external cron can POST to the repository_dispatch
   # API with {"event_type": "poll"} and drive the watcher directly.
